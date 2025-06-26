@@ -1,7 +1,9 @@
+use std::process::Command;
+use clap::{Parser, Subcommand};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -9,6 +11,21 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
 use tokio::process::Command as TokioCommand;
 use warp::Filter;
+
+#[derive(Parser)]
+#[command(name = "exeio")]
+#[command(about = "A process supervisor written in rust to help server programmers to run processes and monitor them from outside the server through a rest API", long_about = None)]
+#[command(author ="philosan")]
+struct Cli {
+    /// Host to bind to
+    #[arg(short = 'H', long, default_value = "127.0.0.1")]
+    host: String,
+
+    /// Port to bind to
+    #[arg(short = 'P', long="port", default_value_t = 8080)]
+    port: u16,
+}
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProcessConfig {
@@ -69,6 +86,8 @@ struct ApiResponse {
 
 #[tokio::main]
 async fn main() {
+    let cli = Cli::parse();
+
     let processes: ProcessMap = Arc::new(Mutex::new(HashMap::new()));
     
     // Load and start preconfigured processes
@@ -139,7 +158,7 @@ async fn main() {
         .or(clear_log)
         .or(list_processes);
     
-    println!("Process Supervisor starting on port 8080");
+    println!("Process Supervisor starting on port {} at {}" , cli.port , cli.host);
     println!("Available endpoints:");
     println!("  POST /add - Add new process");
     println!("  POST /restart/:id - Restart process");
@@ -151,8 +170,13 @@ async fn main() {
     println!("  POST /clear-log/:id - Clear process log");
     println!("  GET /list - List all processes");
     
+    let addr: std::net::IpAddr = cli.host.parse()
+    .unwrap_or_else(|_| {
+        eprintln!("Invalid host address: {}", cli.host);
+        std::process::exit(1);
+    });
     warp::serve(routes)
-        .run(([127, 0, 0, 1], 8080))
+        .run((addr, cli.port))
         .await;
 }
 
