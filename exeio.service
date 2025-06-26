@@ -1,0 +1,14 @@
+[Unit]
+Description=exieo service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/exeio --port 4567 --host 0.0.0.0
+Restart=on-failure
+WorkingDirectory=%h
+Environment=PATH=/usr/bin:/usr/local/bin
+
+[Install]
+WantedBy=multi-user.target
+
