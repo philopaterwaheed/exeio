@@ -78,6 +78,12 @@ struct ProcessInputRequest {
     input: String,
 }
 
+#[derive(Deserialize)]
+struct PaginationParams {
+    page: Option<usize>,
+    page_size: Option<usize>,
+}
+
 #[derive(Serialize)]
 struct ApiResponse {
     success: bool,
@@ -91,7 +97,16 @@ async fn main() {
     let processes: ProcessMap = Arc::new(Mutex::new(HashMap::new()));
     let host = Arc::new(cli.host.clone());
     
-    // Load and start preconfigured processes
+    let log_filter = warp::log::custom(|info| {
+        println!(
+            "exieo: [{}] {} {} -> {}",
+            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"),
+            info.method(),
+            info.path(),
+            info.status()
+        );
+    });
+    
     load_and_start_processes(processes.clone()).await;
     
     // Setup API routes
@@ -155,6 +170,13 @@ async fn main() {
         .and(warp::any().map(move || cli.port))
         .and_then(handle_exeio_info);
     
+    let logs_route = warp::path("logs")
+        .and(warp::path::param::<String>())
+        .and(warp::get())
+        .and(warp::query::<PaginationParams>())
+        .and(processes_filter.clone())
+        .and_then(handle_process_logs);
+    
     let routes = add_process
         .or(restart_process)
         .or(stop_process)
@@ -164,8 +186,11 @@ async fn main() {
         .or(send_input)
         .or(clear_log)
         .or(list_processes)
-        .or(exeio_info);
-    
+        .or(exeio_info)
+        .or(logs_route)
+        .with(log_filter)
+        .with(warp::cors().allow_any_origin());
+   
     println!("Process Supervisor starting on port {} at {}" , cli.port , cli.host);
     println!("Available endpoints:");
     println!("  POST /add - Add new process");
@@ -178,6 +203,7 @@ async fn main() {
     println!("  POST /clear-log/:id - Clear process log");
     println!("  GET /list - List all processes");
     println!("  GET /info - Get supervisor information");
+    println!("GET /logs/:id?page=1&page_size=50 - Get paginated process logs")
     
     let addr: std::net::IpAddr = cli.host.parse()
     .unwrap_or_else(|_| {
@@ -823,7 +849,7 @@ async fn handle_exeio_info(host: String, port: u16) -> Result<impl warp::Reply, 
         "version": "1.0.0",
         "author": "made by philo",
         "url": format!("http://{}:{}", host, port),
-        "end points" : [
+        "endpoints": [
             "POST /add - Add new process",
             "POST /restart/:id - Restart process",
             "POST /stop/:id - Stop process",
@@ -833,11 +859,54 @@ async fn handle_exeio_info(host: String, port: u16) -> Result<impl warp::Reply, 
             "POST /input/:id - Send input to process",
             "POST /clear-log/:id - Clear process log",
             "GET /list - List all processes",
-            "GET /info - Get supervisor information"
+            "GET /info - Get supervisor information",
+            "GET /logs/:id?page=1&page_size=50 - Get paginated process logs"
         ]
     });
     
     Ok(warp::reply::json(&info))
+}
+
+async fn handle_process_logs(
+    id: String,
+    params: PaginationParams,
+    processes: ProcessMap
+) -> Result<impl warp::Reply, warp::Rejection> {
+    let processes_lock = processes.lock().unwrap();
+    if let Some(managed_process) = processes_lock.get(&id) {
+        let log_file_path = &managed_process.config.log_file;
+        let page = params.page.unwrap_or(1).max(1); 
+        let page_size = params.page_size.unwrap_or(50).max(1);
+
+        let lines = match std::fs::read_to_string(log_file_path) {
+            Ok(content) => content.lines().map(|s| s.to_string()).collect::<Vec<_>>(),
+            Err(_) => Vec::new(),
+        };
+
+        let total_lines = lines.len();
+        let start = (page - 1) * page_size;
+        let end = start + page_size;
+        let snippet = if start < total_lines {
+            lines[start.min(total_lines)..end.min(total_lines)].to_vec()
+        } else {
+            Vec::new()
+        };
+
+        let response = serde_json::json!({
+            "success": true,
+            "page": page,
+            "page_size": page_size,
+            "total_lines": total_lines,
+            "logs": snippet
+        });
+        Ok(warp::reply::json(&response))
+    } else {
+        let response = ApiResponse {
+            success: false,
+            message: format!("Process {} not found", id),
+        };
+        Ok(warp::reply::json(&response))
+    }
 }
 
 fn save_process_config(config: &ProcessConfig) {
