@@ -147,6 +147,10 @@ async fn main() {
         .and(warp::get())
         .and(processes_filter.clone())
         .and_then(handle_list_processes);
+
+    let exeio_info = warp::path("info")
+        .and(warp::get())
+        .and_then(handle_exeio_info);
     
     let routes = add_process
         .or(restart_process)
@@ -156,7 +160,8 @@ async fn main() {
         .or(stop_all)
         .or(send_input)
         .or(clear_log)
-        .or(list_processes);
+        .or(list_processes)
+        .or(exeio_info);
     
     println!("Process Supervisor starting on port {} at {}" , cli.port , cli.host);
     println!("Available endpoints:");
@@ -806,6 +811,14 @@ async fn handle_list_processes(processes: ProcessMap) -> Result<impl warp::Reply
     }
     
     Ok(warp::reply::json(&process_list))
+}
+
+async fn handle_exeio_info() -> Result<impl warp::Reply, warp::Rejection> {
+    let info :[&str; 3] = [
+        "exeio - Process Supervisor",
+        "Version: 1.0.0","made by philo"];
+    
+    Ok(warp::reply::json(&info))
 }
 
 fn save_process_config(config: &ProcessConfig) {
