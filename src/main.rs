@@ -89,6 +89,7 @@ async fn main() {
     let cli = Cli::parse();
 
     let processes: ProcessMap = Arc::new(Mutex::new(HashMap::new()));
+    let host = Arc::new(cli.host.clone());
     
     // Load and start preconfigured processes
     load_and_start_processes(processes.clone()).await;
@@ -147,6 +148,12 @@ async fn main() {
         .and(warp::get())
         .and(processes_filter.clone())
         .and_then(handle_list_processes);
+
+    let exeio_info = warp::path("info")
+        .and(warp::get())
+        .and(warp::any().map(move || host.as_str().to_string()))
+        .and(warp::any().map(move || cli.port))
+        .and_then(handle_exeio_info);
     
     let routes = add_process
         .or(restart_process)
@@ -156,7 +163,8 @@ async fn main() {
         .or(stop_all)
         .or(send_input)
         .or(clear_log)
-        .or(list_processes);
+        .or(list_processes)
+        .or(exeio_info);
     
     println!("Process Supervisor starting on port {} at {}" , cli.port , cli.host);
     println!("Available endpoints:");
@@ -169,6 +177,7 @@ async fn main() {
     println!("  POST /input/:id - Send input to process");
     println!("  POST /clear-log/:id - Clear process log");
     println!("  GET /list - List all processes");
+    println!("  GET /info - Get supervisor information");
     
     let addr: std::net::IpAddr = cli.host.parse()
     .unwrap_or_else(|_| {
@@ -806,6 +815,29 @@ async fn handle_list_processes(processes: ProcessMap) -> Result<impl warp::Reply
     }
     
     Ok(warp::reply::json(&process_list))
+}
+
+async fn handle_exeio_info(host: String, port: u16) -> Result<impl warp::Reply, warp::Rejection> {
+    let info = serde_json::json!({
+        "name": "exeio - Process Supervisor",
+        "version": "1.0.0",
+        "author": "made by philo",
+        "url": format!("http://{}:{}", host, port),
+        "end points" : [
+            "POST /add - Add new process",
+            "POST /restart/:id - Restart process",
+            "POST /stop/:id - Stop process",
+            "POST /remove/:id - Remove process",
+            "POST /restart-all - Restart all processes",
+            "POST /stop-all - Stop all processes",
+            "POST /input/:id - Send input to process",
+            "POST /clear-log/:id - Clear process log",
+            "GET /list - List all processes",
+            "GET /info - Get supervisor information"
+        ]
+    });
+    
+    Ok(warp::reply::json(&info))
 }
 
 fn save_process_config(config: &ProcessConfig) {
