@@ -203,7 +203,7 @@ async fn main() {
     println!("  POST /clear-log/:id - Clear process log");
     println!("  GET /list - List all processes");
     println!("  GET /info - Get supervisor information");
-    println!("GET /logs/:id?page=1&page_size=50 - Get paginated process logs")
+    println!("  GET /logs/:id?page=1&page_size=50 - Get paginated process logs");
     
     let addr: std::net::IpAddr = cli.host.parse()
     .unwrap_or_else(|_| {
@@ -273,11 +273,18 @@ async fn start_regular_process(processes: ProcessMap, config: ProcessConfig, log
             if let Some(stdin) = child.stdin.take() {
                 let mut stdin = stdin;
                 thread::spawn(move || {
-                    // waits the sender
-                    while let Ok(input) = stdin_receiver.recv() {
-                        if let Err(e) = writeln!(stdin, "{}", input) {
-                            eprintln!("Failed to write to process stdin: {}", e);
-                            break;
+                    // Keep this thread alive indefinitely to avoid closing stdin
+                    loop {
+                        match stdin_receiver.recv() {
+                            Ok(input) => {
+                                if let Err(e) = writeln!(stdin, "{}", input) {
+                                    eprintln!("Failed to write to process stdin: {}", e);
+                                    break;
+                                }
+                            }
+                            Err(_) => {
+                                thread::sleep(Duration::from_millis(100));
+                            }
                         }
                     }
                 });
