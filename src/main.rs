@@ -121,7 +121,7 @@ async fn main() {
         log_exeio_event(&log_entry, &host_for_log, cli.port); 
     });
     
-    load_and_start_processes(processes.clone()).await;
+    load_and_start_processes(processes.clone(), host.clone(), cli.port).await;
     
     // Ensure config directory exists
     let config_path = get_config_path();
@@ -129,34 +129,49 @@ async fn main() {
     
     // Setup API routes
     let processes_filter = warp::any().map(move || processes.clone());
+    let host_filter = warp::any().map({
+        let host = host.clone();
+        move || host.clone()
+    });
+    let port_filter = warp::any().map(move || cli.port);
     
     let add_process = warp::path("add")
         .and(warp::post())
         .and(warp::body::json())
         .and(processes_filter.clone())
+        .and(host_filter.clone())
+        .and(port_filter.clone())
         .and_then(handle_add_process);
     
     let restart_process = warp::path("restart")
         .and(warp::path::param::<String>())
         .and(warp::post())
         .and(processes_filter.clone())
+        .and(host_filter.clone())
+        .and(port_filter.clone())
         .and_then(handle_restart_process);
     
     let stop_process = warp::path("stop")
         .and(warp::path::param::<String>())
         .and(warp::post())
         .and(processes_filter.clone())
+        .and(host_filter.clone())
+        .and(port_filter.clone())
         .and_then(handle_stop_process);
     
     let remove_process = warp::path("remove")
         .and(warp::path::param::<String>())
         .and(warp::post())
         .and(processes_filter.clone())
+        .and(host_filter.clone())
+        .and(port_filter.clone())
         .and_then(handle_remove_process);
     
     let restart_all = warp::path("restart-all")
         .and(warp::post())
         .and(processes_filter.clone())
+        .and(host_filter.clone())
+        .and(port_filter.clone())
         .and_then(handle_restart_all);
     
     let stop_all = warp::path("stop-all")
@@ -237,20 +252,20 @@ async fn main() {
         .await;
 }
 
-async fn load_and_start_processes(processes: ProcessMap) {
+async fn load_and_start_processes(processes: ProcessMap, host: Arc<String>, port: u16) {
     // Try to load configuration from file
     let config_path = get_config_path();
     if let Ok(config_content) = std::fs::read_to_string(&config_path) {
         // from string to process configurations struct
         if let Ok(configs) = serde_json::from_str::<Vec<ProcessConfig>>(&config_content) {
             for config in configs {
-                start_process(processes.clone(), config).await;
+                start_process(processes.clone(), config, host.clone(), port).await;
             }
         }
     }
 }
 
-async fn start_process(processes: ProcessMap, config: ProcessConfig) {
+async fn start_process(processes: ProcessMap, config: ProcessConfig, host: Arc<String>, port: u16) {
     let log_file = match OpenOptions::new()
         .create(true)
         .append(true)
@@ -264,19 +279,19 @@ async fn start_process(processes: ProcessMap, config: ProcessConfig) {
     
     // Log process start
     if let Ok(mut file) = OpenOptions::new().append(true).open(&config.log_file) {
-        let start_log = format!("[{}] SYSTEM: Starting process '{}' (Run #1)\n", 
-            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), config.id);
+        let start_log = format!("[{}] SYSTEM {}:{}: Starting process '{}' (Run #1)\n", 
+            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), host, port, config.id);
         let _ = file.write_all(start_log.as_bytes());
     }
     
     if config.periodic && config.period_seconds.is_some() {
-        start_periodic_process(processes, config, log_file).await;
+        start_periodic_process(processes, config, log_file, host, port).await;
     } else {
-        start_regular_process(processes, config, log_file).await;
+        start_regular_process(processes, config, log_file, host, port).await;
     }
 }
 
-async fn start_regular_process(processes: ProcessMap, config: ProcessConfig, log_file: File) {
+async fn start_regular_process(processes: ProcessMap, config: ProcessConfig, log_file: File, _host: Arc<String>, _port: u16) {
     let mut cmd = Command::new(&config.command);
     cmd.args(&config.args)
         .stdin(Stdio::piped())
@@ -395,10 +410,11 @@ async fn start_regular_process(processes: ProcessMap, config: ProcessConfig, log
     }
 }
 
-async fn start_periodic_process(processes: ProcessMap, config: ProcessConfig, log_file: File) {
+async fn start_periodic_process(processes: ProcessMap, config: ProcessConfig, log_file: File, host: Arc<String>, port: u16) {
     let period_seconds = config.period_seconds.unwrap_or(60);
     let processes_clone = processes.clone();
     let config_clone = config.clone();
+    let host_clone = host.clone();
     
     let periodic_handle = tokio::spawn(async move {
         let mut run_count = 0u64;
@@ -408,8 +424,8 @@ async fn start_periodic_process(processes: ProcessMap, config: ProcessConfig, lo
             
             // Log periodic run start
             if let Ok(mut file) = OpenOptions::new().append(true).open(&config_clone.log_file) {
-                let run_log = format!("[{}] SYSTEM: Starting periodic run #{} (every {}s)\n", 
-                    chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), run_count, period_seconds);
+                let run_log = format!("[{}] SYSTEM {}:{}: Starting periodic run #{} (every {}s)\n", 
+                    chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), host_clone, port, run_count, period_seconds);
                 let _ = file.write_all(run_log.as_bytes());
             }
             
@@ -481,15 +497,15 @@ async fn start_periodic_process(processes: ProcessMap, config: ProcessConfig, lo
                     match child.wait().await {
                         Ok(status) => {
                             if let Ok(mut file) = OpenOptions::new().append(true).open(&config_clone.log_file) {
-                                let end_log = format!("[{}] SYSTEM: Run #{} completed with status: {}\n", 
-                                    chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), run_count, status);
+                                let end_log = format!("[{}] SYSTEM {}:{}: Run #{} completed with status: {}\n", 
+                                    chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), host_clone, port, run_count, status);
                                 let _ = file.write_all(end_log.as_bytes());
                             }
                         }
                         Err(e) => {
                             if let Ok(mut file) = OpenOptions::new().append(true).open(&config_clone.log_file) {
-                                let error_log = format!("[{}] SYSTEM: Run #{} failed: {}\n", 
-                                    chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), run_count, e);
+                                let error_log = format!("[{}] SYSTEM {}:{}: Run #{} failed: {}\n", 
+                                    chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), host_clone, port, run_count, e);
                                 let _ = file.write_all(error_log.as_bytes());
                             }
                         }
@@ -497,8 +513,8 @@ async fn start_periodic_process(processes: ProcessMap, config: ProcessConfig, lo
                 }
                 Err(e) => {
                     if let Ok(mut file) = OpenOptions::new().append(true).open(&config_clone.log_file) {
-                        let error_log = format!("[{}] SYSTEM: Failed to start run #{}: {}\n", 
-                            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), run_count, e);
+                        let error_log = format!("[{}] SYSTEM {}:{}: Failed to start run #{}: {}\n", 
+                            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), host_clone, port, run_count, e);
                         let _ = file.write_all(error_log.as_bytes());
                     }
                 }
@@ -539,6 +555,8 @@ async fn start_periodic_process(processes: ProcessMap, config: ProcessConfig, lo
 async fn handle_add_process(
     req: AddProcessRequest,
     processes: ProcessMap,
+    host: Arc<String>,
+    port: u16,
 ) -> Result<impl warp::Reply, warp::Rejection> {
     let log_path = get_process_log_path(&req.id);
     
@@ -567,7 +585,7 @@ async fn handle_add_process(
         save_process_config(&config);
     }
     
-    start_process(processes, config).await;
+    start_process(processes, config, host, port).await;
     
     let process_type = if req.periodic.unwrap_or(false) {
         format!("periodic ({}s)", req.period_seconds.unwrap_or(0))
@@ -586,6 +604,8 @@ async fn handle_add_process(
 async fn handle_restart_process(
     id: String,
     processes: ProcessMap,
+    host: Arc<String>,
+    port: u16,
 ) -> Result<impl warp::Reply, warp::Rejection> {
     let config = {
         let mut processes_lock = processes.lock().unwrap();
@@ -611,7 +631,7 @@ async fn handle_restart_process(
     };
     
     if let Some(config) = config {
-        start_process(processes, config).await;
+        start_process(processes, config, host, port).await;
         let response = ApiResponse {
             success: true,
             message: format!("Process {} restarted successfully", id),
@@ -629,6 +649,8 @@ async fn handle_restart_process(
 async fn handle_stop_process(
     id: String,
     processes: ProcessMap,
+    host: Arc<String>,
+    port: u16,
 ) -> Result<impl warp::Reply, warp::Rejection> {
     let mut processes_lock = processes.lock().unwrap();
     if let Some(managed_process) = processes_lock.get_mut(&id) {
@@ -648,8 +670,8 @@ async fn handle_stop_process(
         
         // Log the stop
         if let Ok(mut file) = OpenOptions::new().append(true).open(&managed_process.config.log_file) {
-            let stop_log = format!("[{}] SYSTEM: Process stopped manually\n", 
-                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"));
+            let stop_log = format!("[{}] SYSTEM {}:{}: Process stopped manually\n", 
+                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), host, port);
             let _ = file.write_all(stop_log.as_bytes());
         }
         
@@ -670,6 +692,8 @@ async fn handle_stop_process(
 async fn handle_remove_process(
     id: String,
     processes: ProcessMap,
+    host: Arc<String>,
+    port: u16,
 ) -> Result<impl warp::Reply, warp::Rejection> {
     let mut processes_lock = processes.lock().unwrap();
     if let Some(mut managed_process) = processes_lock.remove(&id) {
@@ -685,8 +709,8 @@ async fn handle_remove_process(
         
         // Log the removal
         if let Ok(mut file) = OpenOptions::new().append(true).open(&managed_process.config.log_file) {
-            let remove_log = format!("[{}] SYSTEM: Process removed from supervisor\n", 
-                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"));
+            let remove_log = format!("[{}] SYSTEM {}:{}: Process removed from supervisor\n", 
+                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), host, port);
             let _ = file.write_all(remove_log.as_bytes());
         }
         
@@ -707,7 +731,7 @@ async fn handle_remove_process(
     }
 }
 
-async fn handle_restart_all(processes: ProcessMap) -> Result<impl warp::Reply, warp::Rejection> {
+async fn handle_restart_all(processes: ProcessMap, host: Arc<String>, port: u16) -> Result<impl warp::Reply, warp::Rejection> {
     let configs: Vec<ProcessConfig> = {
         let mut processes_lock = processes.lock().unwrap();
         let mut configs = Vec::new();
@@ -734,7 +758,7 @@ async fn handle_restart_all(processes: ProcessMap) -> Result<impl warp::Reply, w
     
     // Restart all processes
     for config in configs {
-        start_process(processes.clone(), config).await;
+        start_process(processes.clone(), config, host.clone(), port).await;
     }
     
     let response = ApiResponse {
