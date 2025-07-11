@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
 use tokio::process::Command as TokioCommand;
 use warp::Filter;
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "exeio")]
@@ -97,14 +98,27 @@ async fn main() {
     let processes: ProcessMap = Arc::new(Mutex::new(HashMap::new()));
     let host = Arc::new(cli.host.clone());
     
-    let log_filter = warp::log::custom(|info| {
+    let exeio_log_path = init_exeio_log(&host, cli.port);
+
+    // Create a clone of host for the closure
+    let host_for_log = Arc::clone(&host);
+    let log_filter = warp::log::custom(move |info| {
+        let log_entry = format!(
+            "{} {} -> {}\n",
+            info.method(),
+            info.path(),
+            info.status()
+        );
+        
         println!(
-            "exieo: [{}] {} {} -> {}",
+            "exeio: [{}] {} {} -> {}",
             chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"),
             info.method(),
             info.path(),
             info.status()
         );
+        
+        log_exeio_event(&log_entry, &host_for_log, cli.port); 
     });
     
     load_and_start_processes(processes.clone()).await;
@@ -168,9 +182,11 @@ async fn main() {
         .and(processes_filter.clone())
         .and_then(handle_list_processes);
 
+    // Use another clone of host for the info route
+    let host_for_info = Arc::clone(&host);
     let exeio_info = warp::path("info")
         .and(warp::get())
-        .and(warp::any().map(move || host.as_str().to_string()))
+        .and(warp::any().map(move || Arc::clone(&host_for_info)))
         .and(warp::any().map(move || cli.port))
         .and_then(handle_exeio_info);
     
@@ -195,7 +211,9 @@ async fn main() {
         .with(log_filter)
         .with(warp::cors().allow_any_origin());
    
-    println!("Process Supervisor starting on port {} at {}" , cli.port , cli.host);
+    println!("Process Supervisor starting on port {} at {}", cli.port, cli.host);
+    println!("Logs directory: {}", get_logs_dir().display());
+    println!("Config file: {}", get_config_path().display());
     println!("Available endpoints:");
     println!("  POST /add - Add new process");
     println!("  POST /restart/:id - Restart process");
@@ -522,13 +540,15 @@ async fn handle_add_process(
     req: AddProcessRequest,
     processes: ProcessMap,
 ) -> Result<impl warp::Reply, warp::Rejection> {
+    let log_path = get_process_log_path(&req.id);
+    
     let config = ProcessConfig {
         id: req.id.clone(),
         command: req.command,
         args: req.args,
         working_dir: req.working_dir,
         auto_restart: req.auto_restart,
-        log_file: format!("logs/{}.log", req.id),
+        log_file: log_path.to_string_lossy().into_owned(),
         periodic: req.periodic.unwrap_or(false),
         period_seconds: req.period_seconds,
     };
@@ -541,9 +561,6 @@ async fn handle_add_process(
         };
         return Ok(warp::reply::json(&response));
     }
-    
-    // Create logs directory if it doesn't exist
-    let _ = std::fs::create_dir_all("logs");
     
     // Save to configuration file if requested
     if req.save_for_next_run {
@@ -855,7 +872,7 @@ async fn handle_list_processes(processes: ProcessMap) -> Result<impl warp::Reply
     Ok(warp::reply::json(&process_list))
 }
 
-async fn handle_exeio_info(host: String, port: u16) -> Result<impl warp::Reply, warp::Rejection> {
+async fn handle_exeio_info(host: Arc<String>, port: u16) -> Result<impl warp::Reply, warp::Rejection> {
     let info = serde_json::json!({
         "name": "exeio - Process Supervisor",
         "version": "1.0.0",
@@ -967,4 +984,59 @@ fn get_config_path() -> std::path::PathBuf {
     
     config_dir.push("processes.json");
     config_dir
+}
+
+fn get_logs_dir() -> PathBuf {
+    let mut logs_dir = dirs::home_dir().unwrap_or_else(|| {
+        eprintln!("Could not determine home directory, using current directory instead");
+        std::env::current_dir().unwrap_or_default()
+    });
+    
+    logs_dir.push(".local");
+    logs_dir.push("share");
+    logs_dir.push("exeio");
+    logs_dir.push("logs");
+    
+    // Create the directory if it doesn't exist
+    std::fs::create_dir_all(&logs_dir).unwrap_or_else(|e| {
+        eprintln!("Failed to create logs directory: {}", e);
+    });
+    
+    logs_dir
+}
+
+fn get_process_log_path(process_id: &str) -> PathBuf {
+    let mut path = get_logs_dir();
+    path.push(format!("{}.log", process_id));
+    path
+}
+
+// Update function signature to use &str instead of String
+fn init_exeio_log(host: &Arc<String>, port: u16) -> PathBuf {
+    let mut log_path = get_logs_dir();
+    log_path.push("exeio.log");
+    
+    // Log startup information
+    let start_log = format!("[{}] SYSTEM {}:{}: exeio process supervisor started\n", 
+        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), 
+        host, port
+    );
+    
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&log_path) {
+        let _ = file.write_all(start_log.as_bytes());
+    }
+    
+    log_path
+}
+
+// Update function signature to accept Arc<String>
+fn log_exeio_event(event: &str, host: &Arc<String>, port: u16) {
+    let log_path = get_logs_dir().join("exeio.log");
+    let log_entry = format!("[{}] SYSTEM {}:{}: {}", 
+        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), 
+        host, port, event);
+    
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path) {
+        let _ = file.write_all(log_entry.as_bytes());
+    }
 }
