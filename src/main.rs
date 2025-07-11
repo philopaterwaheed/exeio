@@ -109,6 +109,10 @@ async fn main() {
     
     load_and_start_processes(processes.clone()).await;
     
+    // Ensure config directory exists
+    let config_path = get_config_path();
+    println!("Using config file: {}", config_path.display());
+    
     // Setup API routes
     let processes_filter = warp::any().map(move || processes.clone());
     
@@ -217,7 +221,8 @@ async fn main() {
 
 async fn load_and_start_processes(processes: ProcessMap) {
     // Try to load configuration from file
-    if let Ok(config_content) = std::fs::read_to_string("processes.json") {
+    let config_path = get_config_path();
+    if let Ok(config_content) = std::fs::read_to_string(&config_path) {
         // from string to process configurations struct
         if let Ok(configs) = serde_json::from_str::<Vec<ProcessConfig>>(&config_content) {
             for config in configs {
@@ -921,8 +926,9 @@ fn save_process_config(config: &ProcessConfig) {
     configs.retain(|c| c.id != config.id); // Remove existing config with same id
     configs.push(config.clone());
     
+    let config_path = get_config_path();
     if let Ok(json) = serde_json::to_string_pretty(&configs) {
-        let _ = std::fs::write("processes.json", json);
+        let _ = std::fs::write(&config_path, json);
     }
 }
 
@@ -930,15 +936,35 @@ fn remove_process_config(id: &str) {
     let mut configs = load_configs();
     configs.retain(|c| c.id != id);
     
+    let config_path = get_config_path();
     if let Ok(json) = serde_json::to_string_pretty(&configs) {
-        let _ = std::fs::write("processes.json", json);
+        let _ = std::fs::write(&config_path, json);
     }
 }
 
 fn load_configs() -> Vec<ProcessConfig> {
-    if let Ok(content) = std::fs::read_to_string("processes.json") {
+    let config_path = get_config_path();
+    if let Ok(content) = std::fs::read_to_string(&config_path) {
         serde_json::from_str(&content).unwrap_or_default()
     } else {
         Vec::new()
     }
+}
+
+fn get_config_path() -> std::path::PathBuf {
+    let mut config_dir = dirs::home_dir().unwrap_or_else(|| {
+        eprintln!("Could not determine home directory, using current directory instead");
+        std::env::current_dir().unwrap_or_default()
+    });
+    
+    config_dir.push(".config");
+    config_dir.push("exeio");
+    
+    // Create the directory if it doesn't exist
+    std::fs::create_dir_all(&config_dir).unwrap_or_else(|e| {
+        eprintln!("Failed to create config directory: {}", e);
+    });
+    
+    config_dir.push("processes.json");
+    config_dir
 }
