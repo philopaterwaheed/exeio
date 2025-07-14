@@ -639,6 +639,36 @@ async fn handle_add_process(
     host: Arc<String>,
     port: u16,
 ) -> Result<impl warp::Reply, warp::Rejection> {
+    // Validate that the ID is unique
+    {
+        let processes_lock = processes.lock().unwrap();
+        if processes_lock.contains_key(&req.id) {
+            let response = ApiResponse {
+                success: false,
+                message: format!("Process with ID '{}' already exists. Please use a unique ID.", req.id),
+            };
+            return Ok(warp::reply::json(&response));
+        }
+    }
+    
+    // Validate ID is not empty or just whitespace
+    if req.id.trim().is_empty() {
+        let response = ApiResponse {
+            success: false,
+            message: "Process ID cannot be empty or just whitespace".to_string(),
+        };
+        return Ok(warp::reply::json(&response));
+    }
+    
+    // Validate command is not empty or just whitespace
+    if req.command.trim().is_empty() {
+        let response = ApiResponse {
+            success: false,
+            message: "Process command cannot be empty or just whitespace".to_string(),
+        };
+        return Ok(warp::reply::json(&response));
+    }
+    
     let log_path = get_process_log_path(&req.id);
     
     let config = ProcessConfig {
@@ -659,6 +689,19 @@ async fn handle_add_process(
             message: "Periodic processes must specify period_seconds".to_string(),
         };
         return Ok(warp::reply::json(&response));
+    }
+    
+    // Validate that period_seconds is above zero for periodic processes
+    if config.periodic {
+        if let Some(period) = config.period_seconds {
+            if period <= 0 {
+                let response = ApiResponse {
+                    success: false,
+                    message: "Period seconds must be greater than zero for periodic processes".to_string(),
+                };
+                return Ok(warp::reply::json(&response));
+            }
+        }
     }
     
     // Save to configuration file if requested
