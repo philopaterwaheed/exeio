@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 use serde::{Deserialize, Serialize};
@@ -90,6 +90,94 @@ struct PaginationParams {
 struct ApiResponse {
     success: bool,
     message: String,
+}
+
+// Thread-safe logging and config management
+struct SafeLogger {
+    log_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+}
+
+impl SafeLogger {
+    fn new() -> Self {
+        Self {
+            log_locks: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn get_log_lock(&self, log_path: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.log_locks.lock().unwrap();
+        locks.entry(log_path.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    fn safe_append_log(&self, log_path: &str, content: &str) -> Result<(), std::io::Error> {
+        let lock = self.get_log_lock(log_path);
+        let _guard = lock.lock().unwrap();
+        
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)?;
+        file.write_all(content.as_bytes())?;
+        file.flush()?;
+        Ok(())
+    }
+}
+
+struct SafeConfigManager {
+    config_lock: Arc<RwLock<()>>,
+    config_path: PathBuf,
+}
+
+impl SafeConfigManager {
+    fn new() -> Self {
+        Self {
+            config_lock: Arc::new(RwLock::new(())),
+            config_path: get_config_path(),
+        }
+    }
+
+    fn load_configs(&self) -> Vec<ProcessConfig> {
+        let _read_guard = self.config_lock.read().unwrap();
+        
+        match std::fs::read_to_string(&self.config_path) {
+            Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn save_configs(&self, configs: &[ProcessConfig]) -> Result<(), Box<dyn std::error::Error>> {
+        let _write_guard = self.config_lock.write().unwrap();
+        
+        // Use atomic write: write to temp file, then rename
+        let temp_path = self.config_path.with_extension("json.tmp");
+        let json = serde_json::to_string_pretty(configs)?;
+        
+        std::fs::write(&temp_path, json)?;
+        std::fs::rename(&temp_path, &self.config_path)?;
+        
+        Ok(())
+    }
+
+    fn save_process_config(&self, config: &ProcessConfig) -> Result<(), Box<dyn std::error::Error>> {
+        let mut configs = self.load_configs();
+        configs.retain(|c| c.id != config.id);
+        configs.push(config.clone());
+        self.save_configs(&configs)
+    }
+
+    fn remove_process_config(&self, id: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let mut configs = self.load_configs();
+        configs.retain(|c| c.id != id);
+        self.save_configs(&configs)
+    }
+}
+
+// Global instances
+lazy_static::lazy_static! {
+    static ref SAFE_LOGGER: SafeLogger = SafeLogger::new();
+    static ref CONFIG_MANAGER: SafeConfigManager = SafeConfigManager::new();
 }
 
 #[tokio::main]
@@ -269,15 +357,10 @@ async fn main() {
 }
 
 async fn load_and_start_processes(processes: ProcessMap, host: Arc<String>, port: u16) {
-    // Try to load configuration from file
-    let config_path = get_config_path();
-    if let Ok(config_content) = std::fs::read_to_string(&config_path) {
-        // from string to process configurations struct
-        if let Ok(configs) = serde_json::from_str::<Vec<ProcessConfig>>(&config_content) {
-            for config in configs {
-                start_process(processes.clone(), config, host.clone(), port).await;
-            }
-        }
+    // Load configurations using the safe config manager
+    let configs = CONFIG_MANAGER.load_configs();
+    for config in configs {
+        start_process(processes.clone(), config, host.clone(), port).await;
     }
 }
 
@@ -294,11 +377,9 @@ async fn start_process(processes: ProcessMap, config: ProcessConfig, host: Arc<S
     };
     
     // Log process start
-    if let Ok(mut file) = OpenOptions::new().append(true).open(&config.log_file) {
-        let start_log = format!("[{}] SYSTEM {}:{}: Starting process '{}' (Run #1)\n", 
-            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), host, port, config.id);
-        let _ = file.write_all(start_log.as_bytes());
-    }
+    let start_log = format!("[{}] SYSTEM {}:{}: Starting process '{}' (Run #1)\n", 
+        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), host, port, config.id);
+    let _ = SAFE_LOGGER.safe_append_log(&config.log_file, &start_log);
     
     if config.periodic && config.period_seconds.is_some() {
         start_periodic_process(processes, config, log_file, host, port).await;
@@ -355,9 +436,7 @@ async fn start_regular_process(processes: ProcessMap, config: ProcessConfig, log
                             Ok(line) => {
                                 let log_entry = format!("[{}] STDOUT: {}\n", 
                                     chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), line);
-                                if let Ok(mut file) = OpenOptions::new().append(true).open(&log_file_path) {
-                                    let _ = file.write_all(log_entry.as_bytes());
-                                }
+                                let _ = SAFE_LOGGER.safe_append_log(&log_file_path, &log_entry);
                                 println!("[{}] {}", process_id, line);
                             }
                             Err(_) => break,
@@ -377,9 +456,7 @@ async fn start_regular_process(processes: ProcessMap, config: ProcessConfig, log
                             Ok(line) => {
                                 let log_entry = format!("[{}] STDERR: {}\n", 
                                     chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), line);
-                                if let Ok(mut file) = OpenOptions::new().append(true).open(&log_file_path) {
-                                    let _ = file.write_all(log_entry.as_bytes());
-                                }
+                                let _ = SAFE_LOGGER.safe_append_log(&log_file_path, &log_entry);
                                 eprintln!("[{}] ERROR: {}", process_id, line);
                             }
                             Err(_) => break,
@@ -439,11 +516,9 @@ async fn start_periodic_process(processes: ProcessMap, config: ProcessConfig, lo
             run_count += 1;
             
             // Log periodic run start
-            if let Ok(mut file) = OpenOptions::new().append(true).open(&config_clone.log_file) {
-                let run_log = format!("[{}] SYSTEM {}:{}: Starting periodic run #{} (every {}s)\n", 
-                    chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), host_clone, port, run_count, period_seconds);
-                let _ = file.write_all(run_log.as_bytes());
-            }
+            let run_log = format!("[{}] SYSTEM {}:{}: Starting periodic run #{} (every {}s)\n", 
+                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), host_clone, port, run_count, period_seconds);
+            let _ = SAFE_LOGGER.safe_append_log(&config_clone.log_file, &run_log);
             
             // Update run count and status
             {
@@ -480,9 +555,7 @@ async fn start_periodic_process(processes: ProcessMap, config: ProcessConfig, lo
                             while let Ok(Some(line)) = lines.next_line().await {
                                 let log_entry = format!("[{}] RUN#{} STDOUT: {}\n", 
                                     chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), run_num, line);
-                                if let Ok(mut file) = OpenOptions::new().append(true).open(&log_file_path) {
-                                    let _ = file.write_all(log_entry.as_bytes());
-                                }
+                                let _ = SAFE_LOGGER.safe_append_log(&log_file_path, &log_entry);
                                 println!("[{}] Run#{}: {}", process_id, run_num, line);
                             }
                         });
@@ -501,9 +574,7 @@ async fn start_periodic_process(processes: ProcessMap, config: ProcessConfig, lo
                             while let Ok(Some(line)) = lines.next_line().await {
                                 let log_entry = format!("[{}] RUN#{} STDERR: {}\n", 
                                     chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), run_num, line);
-                                if let Ok(mut file) = OpenOptions::new().append(true).open(&log_file_path) {
-                                    let _ = file.write_all(log_entry.as_bytes());
-                                }
+                                let _ = SAFE_LOGGER.safe_append_log(&log_file_path, &log_entry);
                                 eprintln!("[{}] Run#{} ERROR: {}", process_id, run_num, line);
                             }
                         });
@@ -512,27 +583,21 @@ async fn start_periodic_process(processes: ProcessMap, config: ProcessConfig, lo
                     // Wait for the process to complete
                     match child.wait().await {
                         Ok(status) => {
-                            if let Ok(mut file) = OpenOptions::new().append(true).open(&config_clone.log_file) {
-                                let end_log = format!("[{}] SYSTEM {}:{}: Run #{} completed with status: {}\n", 
-                                    chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), host_clone, port, run_count, status);
-                                let _ = file.write_all(end_log.as_bytes());
-                            }
+                            let end_log = format!("[{}] SYSTEM {}:{}: Run #{} completed with status: {}\n", 
+                                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), host_clone, port, run_count, status);
+                            let _ = SAFE_LOGGER.safe_append_log(&config_clone.log_file, &end_log);
                         }
                         Err(e) => {
-                            if let Ok(mut file) = OpenOptions::new().append(true).open(&config_clone.log_file) {
-                                let error_log = format!("[{}] SYSTEM {}:{}: Run #{} failed: {}\n", 
-                                    chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), host_clone, port, run_count, e);
-                                let _ = file.write_all(error_log.as_bytes());
-                            }
+                            let error_log = format!("[{}] SYSTEM {}:{}: Run #{} failed: {}\n", 
+                                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), host_clone, port, run_count, e);
+                            let _ = SAFE_LOGGER.safe_append_log(&config_clone.log_file, &error_log);
                         }
                     }
                 }
                 Err(e) => {
-                    if let Ok(mut file) = OpenOptions::new().append(true).open(&config_clone.log_file) {
-                        let error_log = format!("[{}] SYSTEM {}:{}: Failed to start run #{}: {}\n", 
-                            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), host_clone, port, run_count, e);
-                        let _ = file.write_all(error_log.as_bytes());
-                    }
+                    let error_log = format!("[{}] SYSTEM {}:{}: Failed to start run #{}: {}\n", 
+                        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), host_clone, port, run_count, e);
+                    let _ = SAFE_LOGGER.safe_append_log(&config_clone.log_file, &error_log);
                 }
             }
             
@@ -598,7 +663,9 @@ async fn handle_add_process(
     
     // Save to configuration file if requested
     if req.save_for_next_run {
-        save_process_config(&config);
+        if let Err(e) = CONFIG_MANAGER.save_process_config(&config) {
+            eprintln!("Failed to save process config: {}", e);
+        }
     }
     
     start_process(processes, config, host, port).await;
@@ -685,11 +752,9 @@ async fn handle_stop_process(
         managed_process.status = ProcessStatus::Stopped;
         
         // Log the stop
-        if let Ok(mut file) = OpenOptions::new().append(true).open(&managed_process.config.log_file) {
-            let stop_log = format!("[{}] SYSTEM {}:{}: Process stopped manually\n", 
-                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), host, port);
-            let _ = file.write_all(stop_log.as_bytes());
-        }
+        let stop_log = format!("[{}] SYSTEM {}:{}: Process stopped manually\n", 
+            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), host, port);
+        let _ = SAFE_LOGGER.safe_append_log(&managed_process.config.log_file, &stop_log);
         
         let response = ApiResponse {
             success: true,
@@ -724,14 +789,14 @@ async fn handle_remove_process(
         }
         
         // Log the removal
-        if let Ok(mut file) = OpenOptions::new().append(true).open(&managed_process.config.log_file) {
-            let remove_log = format!("[{}] SYSTEM {}:{}: Process removed from supervisor\n", 
-                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), host, port);
-            let _ = file.write_all(remove_log.as_bytes());
-        }
+        let remove_log = format!("[{}] SYSTEM {}:{}: Process removed from supervisor\n", 
+            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), host, port);
+        let _ = SAFE_LOGGER.safe_append_log(&managed_process.config.log_file, &remove_log);
         
         // Remove from saved configuration
-        remove_process_config(&id);
+        if let Err(e) = CONFIG_MANAGER.remove_process_config(&id) {
+            eprintln!("Failed to remove process config: {}", e);
+        }
         
         let response = ApiResponse {
             success: true,
@@ -1007,11 +1072,9 @@ async fn handle_shutdown(
             }
             
             // Log process stop
-            if let Ok(mut file) = OpenOptions::new().append(true).open(&managed_process.config.log_file) {
-                let stop_log = format!("[{}] SYSTEM {}:{}: Process stopped due to supervisor shutdown\n", 
-                    chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), host, port);
-                let _ = file.write_all(stop_log.as_bytes());
-            }
+            let stop_log = format!("[{}] SYSTEM {}:{}: Process stopped due to supervisor shutdown\n", 
+                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), host, port);
+            let _ = SAFE_LOGGER.safe_append_log(&managed_process.config.log_file, &stop_log);
             
             managed_process.child = None;
             managed_process.periodic_handle = None;
@@ -1039,36 +1102,6 @@ async fn handle_shutdown(
     });
     
     Ok(warp::reply::json(&response))
-}
-
-fn save_process_config(config: &ProcessConfig) {
-    let mut configs = load_configs();
-    configs.retain(|c| c.id != config.id); // Remove existing config with same id
-    configs.push(config.clone());
-    
-    let config_path = get_config_path();
-    if let Ok(json) = serde_json::to_string_pretty(&configs) {
-        let _ = std::fs::write(&config_path, json);
-    }
-}
-
-fn remove_process_config(id: &str) {
-    let mut configs = load_configs();
-    configs.retain(|c| c.id != id);
-    
-    let config_path = get_config_path();
-    if let Ok(json) = serde_json::to_string_pretty(&configs) {
-        let _ = std::fs::write(&config_path, json);
-    }
-}
-
-fn load_configs() -> Vec<ProcessConfig> {
-    let config_path = get_config_path();
-    if let Ok(content) = std::fs::read_to_string(&config_path) {
-        serde_json::from_str(&content).unwrap_or_default()
-    } else {
-        Vec::new()
-    }
 }
 
 fn get_config_path() -> std::path::PathBuf {
@@ -1125,10 +1158,7 @@ fn init_exeio_log(host: &Arc<String>, port: u16) -> PathBuf {
         host, port
     );
     
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&log_path) {
-        let _ = file.write_all(start_log.as_bytes());
-    }
-    
+    let _ = SAFE_LOGGER.safe_append_log(&log_path.to_string_lossy(), &start_log);
     log_path
 }
 
@@ -1139,9 +1169,7 @@ fn log_exeio_event(event: &str, host: &Arc<String>, port: u16) {
         chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), 
         host, port, event);
     
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path) {
-        let _ = file.write_all(log_entry.as_bytes());
-    }
+    let _ = SAFE_LOGGER.safe_append_log(&log_path.to_string_lossy(), &log_entry);
 }
 
 fn ensure_single_instance() -> Result<(), String> {
@@ -1164,10 +1192,17 @@ fn ensure_single_instance() -> Result<(), String> {
         }
     }
     
-    // Create lock file with current PID
+    // Create lock file with current PID atomically using temp file + rename
     let current_pid = std::process::id();
-    if let Err(e) = fs::write(&lock_path, current_pid.to_string()) {
-        return Err(format!("Failed to create lock file: {}", e));
+    let temp_lock_path = lock_path.with_extension("lock.tmp");
+    
+    if let Err(e) = fs::write(&temp_lock_path, current_pid.to_string()) {
+        return Err(format!("Failed to create temp lock file: {}", e));
+    }
+    
+    if let Err(e) = fs::rename(&temp_lock_path, &lock_path) {
+        let _ = fs::remove_file(&temp_lock_path); // Clean up temp file
+        return Err(format!("Failed to create lock file atomically: {}", e));
     }
     
     // Set up cleanup handler for graceful shutdown
