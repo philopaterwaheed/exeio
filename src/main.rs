@@ -1,5 +1,5 @@
 use std::process::Command;
-use clap::{Parser, Subcommand};
+use clap::Parser;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -8,10 +8,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
+use tokio::io::{AsyncBufReadExt, BufReader as TokioBufReader};
 use tokio::process::Command as TokioCommand;
 use warp::Filter;
 use std::path::PathBuf;
+use std::fs;
 
 #[derive(Parser)]
 #[command(name = "exeio")]
@@ -95,10 +96,16 @@ struct ApiResponse {
 async fn main() {
     let cli = Cli::parse();
 
+    // Check for single instance before doing anything else
+    if let Err(e) = ensure_single_instance() {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
+    }
+
     let processes: ProcessMap = Arc::new(Mutex::new(HashMap::new()));
     let host = Arc::new(cli.host.clone());
     
-    let exeio_log_path = init_exeio_log(&host, cli.port);
+    let _exeio_log_path = init_exeio_log(&host, cli.port);
 
     // Create a clone of host for the closure
     let host_for_log = Arc::clone(&host);
@@ -1062,5 +1069,107 @@ fn log_exeio_event(event: &str, host: &Arc<String>, port: u16) {
     
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path) {
         let _ = file.write_all(log_entry.as_bytes());
+    }
+}
+
+fn ensure_single_instance() -> Result<(), String> {
+    let lock_path = get_lock_file_path();
+    
+    // Check if lock file exists and if the process is still running
+    if lock_path.exists() {
+        if let Ok(pid_content) = fs::read_to_string(&lock_path) {
+            if let Ok(pid) = pid_content.trim().parse::<u32>() {
+                if is_process_running(pid) {
+                    return Err(format!(
+                        "Another instance of exeio is already running (PID: {}). Lock file: {}",
+                        pid, lock_path.display()
+                    ));
+                } else {
+                    // Process not running, remove stale lock file
+                    let _ = fs::remove_file(&lock_path);
+                }
+            }
+        }
+    }
+    
+    // Create lock file with current PID
+    let current_pid = std::process::id();
+    if let Err(e) = fs::write(&lock_path, current_pid.to_string()) {
+        return Err(format!("Failed to create lock file: {}", e));
+    }
+    
+    // Set up cleanup handler for graceful shutdown
+    setup_cleanup_handler(lock_path.clone());
+    
+    println!("Single instance lock acquired (PID: {}, Lock: {})", current_pid, lock_path.display());
+    Ok(())
+}
+
+fn get_lock_file_path() -> PathBuf {
+    let mut lock_dir = dirs::home_dir().unwrap_or_else(|| {
+        eprintln!("Could not determine home directory, using /tmp instead");
+        PathBuf::from("/tmp")
+    });
+    
+    lock_dir.push(".local");
+    lock_dir.push("share");
+    lock_dir.push("exeio");
+    
+    // Create the directory if it doesn't exist
+    fs::create_dir_all(&lock_dir).unwrap_or_else(|e| {
+        eprintln!("Failed to create lock directory: {}", e);
+    });
+    
+    lock_dir.push("exeio.lock");
+    lock_dir
+}
+
+fn is_process_running(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        use std::process::Command;
+        
+        // Use kill -0 to check if process exists without actually killing it
+        match Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .output()
+        {
+            Ok(output) => output.status.success(),
+            Err(_) => false,
+        }
+    }
+    
+}
+
+fn setup_cleanup_handler(lock_path: PathBuf) {
+    // Set up signal handlers for graceful cleanup
+    #[cfg(unix)]
+    {
+        use signal_hook::{consts::SIGTERM, consts::SIGINT, iterator::Signals};
+        
+        let lock_path_clone = lock_path.clone();
+        thread::spawn(move || {
+            let mut signals = Signals::new(&[SIGINT, SIGTERM]).expect("Failed to create signal handler");
+            for _sig in signals.forever() {
+                cleanup_lock_file(&lock_path_clone);
+                std::process::exit(0);
+            }
+        });
+    }
+    
+    // Also clean up on normal program termination
+    let lock_path_clone = lock_path;
+    std::panic::set_hook(Box::new(move |_| {
+        cleanup_lock_file(&lock_path_clone);
+    }));
+}
+
+fn cleanup_lock_file(lock_path: &PathBuf) {
+    if lock_path.exists() {
+        if let Err(e) = fs::remove_file(lock_path) {
+            eprintln!("Failed to remove lock file: {}", e);
+        } else {
+            println!("Lock file removed: {}", lock_path.display());
+        }
     }
 }
