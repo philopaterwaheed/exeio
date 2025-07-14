@@ -26,6 +26,10 @@ struct Cli {
     /// Port to bind to
     #[arg(short = 'P', long="port", default_value_t = 8080)]
     port: u16,
+
+    /// API key for authentication (if not provided, a random key will be generated)
+    #[arg(short = 'k', long="api-key")]
+    api_key: Option<String>,
 }
 
 
@@ -90,6 +94,65 @@ struct PaginationParams {
 struct ApiResponse {
     success: bool,
     message: String,
+}
+
+// Authentication-related structures and functions
+#[derive(Serialize)]
+struct AuthError {
+    success: bool,
+    message: String,
+}
+
+fn generate_api_key() -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    
+    let mut hasher = DefaultHasher::new();
+    std::time::SystemTime::now().hash(&mut hasher);
+    std::process::id().hash(&mut hasher);
+    
+    format!("exeio_philo{:x}", hasher.finish())
+}
+
+fn with_auth(api_key: Arc<String>) -> impl Filter<Extract = (), Error = warp::Rejection> + Clone {
+    warp::header::optional::<String>("exeio-api-key")
+        .and(warp::any().map(move || api_key.clone()))
+        .and_then(validate_api_key)
+        .untuple_one()
+}
+
+async fn validate_api_key(provided_key: Option<String>, expected_key: Arc<String>) -> Result<(), warp::Rejection> {
+    match provided_key {
+        Some(key) if key == *expected_key => Ok(()),
+        _ => Err(warp::reject::custom(AuthenticationError))
+    }
+}
+
+#[derive(Debug)]
+struct AuthenticationError;
+
+impl warp::reject::Reject for AuthenticationError {}
+
+async fn handle_auth_error(err: warp::Rejection) -> Result<impl warp::Reply, std::convert::Infallible> {
+    if err.find::<AuthenticationError>().is_some() {
+        let response = AuthError {
+            success: false,
+            message: "Invalid or missing API key. Provide a valid key in the 'exeio-api-key' header.".to_string(),
+        };
+        Ok(warp::reply::with_status(
+            warp::reply::json(&response),
+            warp::http::StatusCode::UNAUTHORIZED,
+        ))
+    } else {
+        let response = AuthError {
+            success: false,
+            message: "Internal server error".to_string(),
+        };
+        Ok(warp::reply::with_status(
+            warp::reply::json(&response),
+            warp::http::StatusCode::INTERNAL_SERVER_ERROR,
+        ))
+    }
 }
 
 // Thread-safe logging and config management
@@ -190,6 +253,11 @@ async fn main() {
         std::process::exit(1);
     }
 
+    // Generate or use provided API key
+    let api_key = Arc::new(
+        cli.api_key.unwrap_or_else(|| generate_api_key())
+    );
+
     let processes: ProcessMap = Arc::new(Mutex::new(HashMap::new()));
     let host = Arc::new(cli.host.clone());
     
@@ -229,9 +297,11 @@ async fn main() {
         move || host.clone()
     });
     let port_filter = warp::any().map(move || cli.port);
+    let auth_filter = with_auth(api_key.clone());
     
     let add_process = warp::path("add")
         .and(warp::post())
+        .and(auth_filter.clone())
         .and(warp::body::json())
         .and(processes_filter.clone())
         .and(host_filter.clone())
@@ -241,6 +311,7 @@ async fn main() {
     let restart_process = warp::path("restart")
         .and(warp::path::param::<String>())
         .and(warp::post())
+        .and(auth_filter.clone())
         .and(processes_filter.clone())
         .and(host_filter.clone())
         .and(port_filter.clone())
@@ -249,6 +320,7 @@ async fn main() {
     let stop_process = warp::path("stop")
         .and(warp::path::param::<String>())
         .and(warp::post())
+        .and(auth_filter.clone())
         .and(processes_filter.clone())
         .and(host_filter.clone())
         .and(port_filter.clone())
@@ -257,6 +329,7 @@ async fn main() {
     let remove_process = warp::path("remove")
         .and(warp::path::param::<String>())
         .and(warp::post())
+        .and(auth_filter.clone())
         .and(processes_filter.clone())
         .and(host_filter.clone())
         .and(port_filter.clone())
@@ -264,6 +337,7 @@ async fn main() {
     
     let restart_all = warp::path("restart-all")
         .and(warp::post())
+        .and(auth_filter.clone())
         .and(processes_filter.clone())
         .and(host_filter.clone())
         .and(port_filter.clone())
@@ -271,12 +345,14 @@ async fn main() {
     
     let stop_all = warp::path("stop-all")
         .and(warp::post())
+        .and(auth_filter.clone())
         .and(processes_filter.clone())
         .and_then(handle_stop_all);
     
     let send_input = warp::path("input")
         .and(warp::path::param::<String>())
         .and(warp::post())
+        .and(auth_filter.clone())
         .and(warp::body::json())
         .and(processes_filter.clone())
         .and_then(handle_send_input);
@@ -284,15 +360,17 @@ async fn main() {
     let clear_log = warp::path("clear-log")
         .and(warp::path::param::<String>())
         .and(warp::post())
+        .and(auth_filter.clone())
         .and(processes_filter.clone())
         .and_then(handle_clear_log);
     
     let list_processes = warp::path("list")
         .and(warp::get())
+        .and(auth_filter.clone())
         .and(processes_filter.clone())
         .and_then(handle_list_processes);
 
-    // Use another clone of host for the info route
+    // Use another clone of host for the info route - this one stays unprotected for health checks
     let host_for_info = Arc::clone(&host);
     let exeio_info = warp::path("info")
         .and(warp::get())
@@ -303,12 +381,14 @@ async fn main() {
     let logs_route = warp::path("logs")
         .and(warp::path::param::<String>())
         .and(warp::get())
+        .and(auth_filter.clone())
         .and(warp::query::<PaginationParams>())
         .and(processes_filter.clone())
         .and_then(handle_process_logs);
     
     let shutdown_route = warp::path("shutdown")
         .and(warp::post())
+        .and(auth_filter.clone())
         .and(processes_filter.clone())
         .and(host_filter.clone())
         .and(port_filter.clone())
@@ -326,25 +406,28 @@ async fn main() {
         .or(exeio_info)
         .or(logs_route)
         .or(shutdown_route)
+        .recover(handle_auth_error)
         .with(log_filter)
         .with(warp::cors().allow_any_origin());
    
     println!("Process Supervisor starting on port {} at {}", cli.port, cli.host);
+    println!("API Key: {}", api_key);
+    println!("NOTE: All endpoints except /info require the 'exeio-api-key' header with the above key");
     println!("Logs directory: {}", get_logs_dir().display());
     println!("Config file: {}", get_config_path().display());
     println!("  Available endpoints:");
-    println!("  POST /add - Add new process");
-    println!("  POST /restart/:id - Restart process");
-    println!("  POST /stop/:id - Stop process");
-    println!("  POST /remove/:id - Remove process");
-    println!("  POST /restart-all - Restart all processes");
-    println!("  POST /stop-all - Stop all processes");
-    println!("  POST /input/:id - Send input to process");
-    println!("  POST /clear-log/:id - Clear process log");
-    println!("  GET /list - List all processes");
-    println!("  GET /info - Get supervisor information");
-    println!("  GET /logs/:id?page=1&page_size=50 - Get paginated process logs");
-    println!("  POST /shutdown - Shutdown supervisor");
+    println!("  POST /add - Add new process (protected)");
+    println!("  POST /restart/:id - Restart process (protected)");
+    println!("  POST /stop/:id - Stop process (protected)");
+    println!("  POST /remove/:id - Remove process (protected)");
+    println!("  POST /restart-all - Restart all processes (protected)");
+    println!("  POST /stop-all - Stop all processes (protected)");
+    println!("  POST /input/:id - Send input to process (protected)");
+    println!("  POST /clear-log/:id - Clear process log (protected)");
+    println!("  GET /list - List all processes (protected)");
+    println!("  GET /info - Get supervisor information (public)");
+    println!("  GET /logs/:id?page=1&page_size=50 - Get paginated process logs (protected)");
+    println!("  POST /shutdown - Shutdown supervisor (protected)");
     
     let addr: std::net::IpAddr = cli.host.parse()
     .unwrap_or_else(|_| {
@@ -683,26 +766,24 @@ async fn handle_add_process(
     };
     
     // Validate periodic configuration
-    if config.periodic && config.period_seconds.is_none() {
+    if config.periodic {
+    if let Some(seconds) = config.period_seconds {
+        if seconds <= 0 {
+            let response = ApiResponse {
+                success: false,
+                message: "period_seconds must be greater than zero".to_string(),
+            };
+            return Ok(warp::reply::json(&response));
+        }
+    } else {
         let response = ApiResponse {
             success: false,
             message: "Periodic processes must specify period_seconds".to_string(),
         };
         return Ok(warp::reply::json(&response));
     }
-    
-    // Validate that period_seconds is above zero for periodic processes
-    if config.periodic {
-        if let Some(period) = config.period_seconds {
-            if period <= 0 {
-                let response = ApiResponse {
-                    success: false,
-                    message: "Period seconds must be greater than zero for periodic processes".to_string(),
-                };
-                return Ok(warp::reply::json(&response));
-            }
-        }
-    }
+}
+
     
     // Save to configuration file if requested
     if req.save_for_next_run {
