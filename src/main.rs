@@ -219,6 +219,13 @@ async fn main() {
         .and(processes_filter.clone())
         .and_then(handle_process_logs);
     
+    let shutdown_route = warp::path("shutdown")
+        .and(warp::post())
+        .and(processes_filter.clone())
+        .and(host_filter.clone())
+        .and(port_filter.clone())
+        .and_then(handle_shutdown);
+    
     let routes = add_process
         .or(restart_process)
         .or(stop_process)
@@ -230,13 +237,14 @@ async fn main() {
         .or(list_processes)
         .or(exeio_info)
         .or(logs_route)
+        .or(shutdown_route)
         .with(log_filter)
         .with(warp::cors().allow_any_origin());
    
     println!("Process Supervisor starting on port {} at {}", cli.port, cli.host);
     println!("Logs directory: {}", get_logs_dir().display());
     println!("Config file: {}", get_config_path().display());
-    println!("Available endpoints:");
+    println!("  Available endpoints:");
     println!("  POST /add - Add new process");
     println!("  POST /restart/:id - Restart process");
     println!("  POST /stop/:id - Stop process");
@@ -248,6 +256,7 @@ async fn main() {
     println!("  GET /list - List all processes");
     println!("  GET /info - Get supervisor information");
     println!("  GET /logs/:id?page=1&page_size=50 - Get paginated process logs");
+    println!("  POST /shutdown - Shutdown supervisor");
     
     let addr: std::net::IpAddr = cli.host.parse()
     .unwrap_or_else(|_| {
@@ -920,7 +929,8 @@ async fn handle_exeio_info(host: Arc<String>, port: u16) -> Result<impl warp::Re
             "POST /clear-log/:id - Clear process log",
             "GET /list - List all processes",
             "GET /info - Get supervisor information",
-            "GET /logs/:id?page=1&page_size=50 - Get paginated process logs"
+            "GET /logs/:id?page=1&page_size=50 - Get paginated process logs",
+            "POST /shutdown - Shutdown supervisor"
         ]
     });
     
@@ -967,6 +977,68 @@ async fn handle_process_logs(
         };
         Ok(warp::reply::json(&response))
     }
+}
+
+async fn handle_shutdown(
+    processes: ProcessMap,
+    host: Arc<String>,
+    port: u16,
+) -> Result<impl warp::Reply, warp::Rejection> {
+    // Log shutdown request
+    let shutdown_log = format!("[{}] SYSTEM {}:{}: Shutdown requested via API\n", 
+        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), host, port);
+    log_exeio_event(&shutdown_log, &host, port);
+    
+    // Stop all processes gracefully
+    {
+        let mut processes_lock = processes.lock().unwrap();
+        for (id, managed_process) in processes_lock.iter_mut() {
+            // Stop regular processes
+            if let Some(ref mut child) = managed_process.child {
+                println!("Stopping process: {}", id);
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            
+            // Stop periodic tasks
+            if let Some(handle) = managed_process.periodic_handle.take() {
+                println!("Stopping periodic task: {}", id);
+                handle.abort();
+            }
+            
+            // Log process stop
+            if let Ok(mut file) = OpenOptions::new().append(true).open(&managed_process.config.log_file) {
+                let stop_log = format!("[{}] SYSTEM {}:{}: Process stopped due to supervisor shutdown\n", 
+                    chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), host, port);
+                let _ = file.write_all(stop_log.as_bytes());
+            }
+            
+            managed_process.child = None;
+            managed_process.periodic_handle = None;
+            managed_process.status = ProcessStatus::Stopped;
+        }
+    }
+    
+    // Log final shutdown message
+    let final_log = format!("[{}] SYSTEM {}:{}: exeio supervisor shutting down\n", 
+        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), host, port);
+    log_exeio_event(&final_log, &host, port);
+    
+    println!("Shutting down exeio supervisor...");
+    
+    let response = ApiResponse {
+        success: true,
+        message: "Supervisor shutdown initiated".to_string(),
+    };
+    
+    // Schedule shutdown after a brief delay to allow response to be sent
+    tokio::spawn(async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cleanup_lock_file(&get_lock_file_path());
+        std::process::exit(0);
+    });
+    
+    Ok(warp::reply::json(&response))
 }
 
 fn save_process_config(config: &ProcessConfig) {
