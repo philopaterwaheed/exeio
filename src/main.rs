@@ -2,7 +2,7 @@ use std::process::Command;
 use clap::Parser;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Write, Read};
 use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
@@ -1137,28 +1137,25 @@ async fn handle_process_logs(
         let page = params.page.unwrap_or(1).max(1); 
         let page_size = params.page_size.unwrap_or(50).max(1);
 
-        let lines = match std::fs::read_to_string(log_file_path) {
-            Ok(content) => content.lines().map(|s| s.to_string()).collect::<Vec<_>>(),
-            Err(_) => Vec::new(),
-        };
-
-        let total_lines = lines.len();
-        let start = (page - 1) * page_size;
-        let end = start + page_size;
-        let snippet = if start < total_lines {
-            lines[start.min(total_lines)..end.min(total_lines)].to_vec()
-        } else {
-            Vec::new()
-        };
-
-        let response = serde_json::json!({
-            "success": true,
-            "page": page,
-            "page_size": page_size,
-            "total_lines": total_lines,
-            "logs": snippet
-        });
-        Ok(warp::reply::json(&response))
+        match read_logs_reverse_paginated(log_file_path, page, page_size) {
+            Ok((logs, total_lines)) => {
+                let response = serde_json::json!({
+                    "success": true,
+                    "page": page,
+                    "page_size": page_size,
+                    "total_lines": total_lines,
+                    "logs": logs
+                });
+                Ok(warp::reply::json(&response))
+            }
+            Err(e) => {
+                let response = ApiResponse {
+                    success: false,
+                    message: format!("Failed to read logs for process {}: {}", id, e),
+                };
+                Ok(warp::reply::json(&response))
+            }
+        }
     } else {
         let response = ApiResponse {
             success: false,
@@ -1403,4 +1400,139 @@ fn cleanup_lock_file(lock_path: &PathBuf) {
             println!("Lock file removed: {}", lock_path.display());
         }
     }
+}
+
+fn read_logs_reverse_paginated(
+    log_file_path: &str, 
+    page: usize, 
+    page_size: usize
+) -> Result<(Vec<String>, usize), std::io::Error> {
+    let file = File::open(log_file_path)?;
+    let file_size = file.metadata()?.len();
+    
+    if file_size == 0 {
+        return Ok((Vec::new(), 0));
+    }
+    
+    // For small files (< 512KB) or early pages, use simpler approach
+    if file_size < 524_288 || page <= 3 {
+        return read_logs_simple(file, page, page_size);
+    }
+    
+    // For large files, use chunked reading
+    read_logs_chunked(file, file_size, page, page_size)
+}
+
+fn read_logs_simple(
+    file: File, 
+    page: usize, 
+    page_size: usize
+) -> Result<(Vec<String>, usize), std::io::Error> {
+    let mut reader = BufReader::with_capacity(32768, file);
+    let mut all_lines = Vec::new();
+    let mut line = String::new();
+    
+    while reader.read_line(&mut line)? > 0 {
+        let trimmed = line.trim_end();
+        if !trimmed.is_empty() {
+            all_lines.push(trimmed.to_string());
+        }
+        line.clear();
+    }
+    
+    let total_lines = all_lines.len();
+    all_lines.reverse(); // Reverse to get newest first
+    
+    let lines_to_skip = (page - 1) * page_size;
+    let result_lines: Vec<String> = all_lines
+        .into_iter()
+        .skip(lines_to_skip)
+        .take(page_size)
+        .collect();
+    
+    Ok((result_lines, total_lines))
+}
+
+fn read_logs_chunked(
+    file: File,
+    file_size: u64,
+    page: usize,
+    page_size: usize,
+) -> Result<(Vec<String>, usize), std::io::Error> {
+    use std::io::{Seek, SeekFrom};
+    
+    let mut reader = BufReader::with_capacity(32768, file);
+    let mut lines = Vec::new();
+    let mut total_lines = 0;
+    let mut buffer = Vec::new();
+    let mut pos = file_size;
+    
+    let lines_to_skip = (page - 1) * page_size;
+    let lines_to_read = page_size;
+    let mut lines_found = 0;
+    let mut lines_collected = 0;
+    
+    const CHUNK_SIZE: u64 = 32768; // 32KB chunks
+    
+    while pos > 0 && (lines_collected < lines_to_read || total_lines == 0) {
+        let chunk_start = if pos >= CHUNK_SIZE { pos - CHUNK_SIZE } else { 0 };
+        let chunk_size = pos - chunk_start;
+        
+        reader.seek(SeekFrom::Start(chunk_start))?;
+        
+        let mut chunk = vec![0u8; chunk_size as usize];
+        reader.read_exact(&mut chunk)?;
+        
+        if buffer.is_empty() {
+            buffer = chunk;
+        } else {
+            let mut new_buffer = Vec::with_capacity(chunk.len() + buffer.len());
+            new_buffer.extend_from_slice(&chunk);
+            new_buffer.extend_from_slice(&buffer);
+            buffer = new_buffer;
+        }
+        
+        let mut line_start = buffer.len();
+        
+        // Scan backwards for newlines
+        for (i, &byte) in buffer.iter().enumerate().rev() {
+            if byte == b'\n' || i == 0 {
+                let line_end = if byte == b'\n' { line_start } else { buffer.len() };
+                let actual_start = if byte == b'\n' && i > 0 { i + 1 } else { i };
+                
+                if actual_start < line_end {
+                    let line = String::from_utf8_lossy(&buffer[actual_start..line_end]);
+                    let trimmed_line = line.trim_end();
+                    if !trimmed_line.is_empty() {
+                        total_lines += 1;
+                        lines_found += 1;
+                        
+                        // Only collect lines we want to return (after skipping)
+                        if lines_found > lines_to_skip && lines_collected < lines_to_read {
+                            lines.push(trimmed_line.to_string());
+                            lines_collected += 1;
+                        }
+                    }
+                }
+                line_start = i;
+            }
+        }
+        
+        // Keep only the unprocessed part of buffer for next iteration
+        if line_start > 0 {
+            buffer.truncate(line_start);
+        } else {
+            buffer.clear();
+        }
+        
+        pos = chunk_start;
+        
+        // Early termination if we have collected enough lines and read the whole file
+        if lines_collected >= lines_to_read && pos == 0 {
+            break;
+        }
+    }
+    
+    lines.reverse();
+    Ok((lines, total_lines))
 }
