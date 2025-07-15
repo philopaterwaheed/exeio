@@ -14,6 +14,13 @@ use warp::Filter;
 use std::path::PathBuf;
 use std::fs;
 
+#[derive(Debug, Clone)]
+struct RestartRequest {
+    process_id: String,
+    delay_seconds: u64,
+    reason: String,
+}
+
 #[derive(Parser)]
 #[command(name = "exeio")]
 #[command(about = "A process supervisor written in rust to help server programmers to run processes and monitor them from outside the server through a rest API", long_about = None)]
@@ -55,6 +62,8 @@ struct ManagedProcess {
     last_run: Option<chrono::DateTime<chrono::Utc>>,
     periodic_handle: Option<tokio::task::JoinHandle<()>>,
     status: ProcessStatus,
+    auto_restart_handle: Option<tokio::task::JoinHandle<()>>, // Handle for auto-restart monitor
+    last_exit_time: Option<chrono::DateTime<chrono::Utc>>, // Track when process last exited
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -63,6 +72,7 @@ enum ProcessStatus {
     Stopped,
     WaitingForPeriod,
     Failed,
+    ManuallyStopped,
 }
 
 type ProcessMap = Arc<Mutex<HashMap<String, ManagedProcess>>>;
@@ -241,6 +251,8 @@ impl SafeConfigManager {
 lazy_static::lazy_static! {
     static ref SAFE_LOGGER: SafeLogger = SafeLogger::new();
     static ref CONFIG_MANAGER: SafeConfigManager = SafeConfigManager::new();
+    static ref RESTART_SENDER: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<RestartRequest>>>> = 
+        Arc::new(Mutex::new(None));
 }
 
 #[tokio::main]
@@ -282,6 +294,38 @@ async fn main() {
         );
         
         log_exeio_event(&log_entry, &host_for_log, cli.port); 
+    });
+    
+    
+    // Set up restart handler
+    let (restart_tx, mut restart_rx) = tokio::sync::mpsc::unbounded_channel::<RestartRequest>();
+    {
+        let mut sender = RESTART_SENDER.lock().unwrap();
+        *sender = Some(restart_tx);
+    }
+    
+    // Start restart handler task
+    let restart_processes = processes.clone();
+    let restart_host = host.clone();
+    let restart_port = cli.port;
+    tokio::spawn(async move {
+        while let Some(request) = restart_rx.recv().await {
+            tokio::time::sleep(Duration::from_secs(request.delay_seconds)).await;
+            
+            let restart_log = format!("[{}] SYSTEM {}:{}: {}\n", 
+                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), restart_host, restart_port, request.reason);
+            
+            // Get the config for this process
+            let config = {
+                let processes_lock = restart_processes.lock().unwrap();
+                processes_lock.get(&request.process_id).map(|p| p.config.clone())
+            };
+            
+            if let Some(config) = config {
+                let _ = SAFE_LOGGER.safe_append_log(&config.log_file, &restart_log);
+                start_process(restart_processes.clone(), config, restart_host.clone(), restart_port).await;
+            }
+        }
     });
     
     load_and_start_processes(processes.clone(), host.clone(), cli.port).await;
@@ -459,19 +503,29 @@ async fn start_process(processes: ProcessMap, config: ProcessConfig, host: Arc<S
         }
     };
     
+    // Get current run count
+    let current_run_count = {
+        let processes_lock = processes.lock().unwrap();
+        if let Some(managed_process) = processes_lock.get(&config.id) {
+            managed_process.run_count
+        } else {
+            1
+        }
+    };
+    
     // Log process start
-    let start_log = format!("[{}] SYSTEM {}:{}: Starting process '{}' (Run #1)\n", 
-        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), host, port, config.id);
+    let start_log = format!("[{}] SYSTEM {}:{}: Starting process '{}' (Run #{})\n", 
+        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), host, port, config.id, current_run_count);
     let _ = SAFE_LOGGER.safe_append_log(&config.log_file, &start_log);
     
     if config.periodic && config.period_seconds.is_some() {
         start_periodic_process(processes, config, log_file, host, port).await;
     } else {
-        start_regular_process(processes, config, log_file, host, port).await;
+        start_regular_process(processes, config, log_file, host, port, current_run_count).await;
     }
 }
 
-async fn start_regular_process(processes: ProcessMap, config: ProcessConfig, log_file: File, _host: Arc<String>, _port: u16) {
+async fn start_regular_process(processes: ProcessMap, config: ProcessConfig, log_file: File, host: Arc<String>, port: u16, run_count: u64) {
     let mut cmd = Command::new(&config.command);
     cmd.args(&config.args)
         .stdin(Stdio::piped())
@@ -484,6 +538,8 @@ async fn start_regular_process(processes: ProcessMap, config: ProcessConfig, log
     
     match cmd.spawn() {
         Ok(mut child) => {
+            let child_id = child.id();
+            
             // create a channel for sending input to the child process
             let (stdin_sender, stdin_receiver) = std::sync::mpsc::channel::<String>();
             
@@ -553,15 +609,36 @@ async fn start_regular_process(processes: ProcessMap, config: ProcessConfig, log
                 child: Some(child),
                 log_file,
                 stdin_sender: Some(stdin_sender),
-                run_count: 1,
+                run_count: run_count,
                 last_run: Some(chrono::Utc::now()),
                 periodic_handle: None,
                 status: ProcessStatus::Running,
+                auto_restart_handle: None,
+                last_exit_time: None,
             };
             
             {
                 let mut processes_lock = processes.lock().unwrap();
                 processes_lock.insert(config.id.clone(), managed_process);
+            }
+            
+            // Start auto-restart monitoring if enabled
+            if config.auto_restart {
+                let auto_restart_handle = start_auto_restart_monitor(
+                    processes.clone(), 
+                    config.clone(), 
+                    host.clone(), 
+                    port, 
+                    child_id
+                );
+                
+                // Store the auto-restart handle
+                {
+                    let mut processes_lock = processes.lock().unwrap();
+                    if let Some(managed_process) = processes_lock.get_mut(&config.id) {
+                        managed_process.auto_restart_handle = Some(auto_restart_handle);
+                    }
+                }
             }
             
             println!("Started process: {} ({})", config.id, config.command);
@@ -578,10 +655,30 @@ async fn start_regular_process(processes: ProcessMap, config: ProcessConfig, log
                 last_run: None,
                 periodic_handle: None,
                 status: ProcessStatus::Failed,
+                auto_restart_handle: None,
+                last_exit_time: None,
             };
             
-            let mut processes_lock = processes.lock().unwrap();
-            processes_lock.insert(config.id.clone(), managed_process);
+            {
+                let mut processes_lock = processes.lock().unwrap();
+                processes_lock.insert(config.id.clone(), managed_process);
+            }
+            
+            // If auto-restart is enabled and process failed to start, try to restart after a delay
+            if config.auto_restart {
+                let config_id = config.id.clone();
+                
+                tokio::spawn(async move {
+                    if let Some(sender) = RESTART_SENDER.lock().unwrap().as_ref() {
+                        let request = RestartRequest {
+                            process_id: config_id.clone(),
+                            delay_seconds: 5,
+                            reason: format!("Auto-restarting process '{}' after failed start", config_id),
+                        };
+                        let _ = sender.send(request);
+                    }
+                });
+            }
         }
     }
 }
@@ -706,6 +803,8 @@ async fn start_periodic_process(processes: ProcessMap, config: ProcessConfig, lo
         last_run: None,
         periodic_handle: Some(periodic_handle),
         status: ProcessStatus::WaitingForPeriod,
+        auto_restart_handle: None,
+        last_exit_time: None,
     };
     
     {
@@ -792,7 +891,7 @@ async fn handle_add_process(
         }
     }
     
-    start_process(processes, config, host, port).await;
+    start_process(processes, config.clone(), host, port).await;
     
     let process_type = if req.periodic.unwrap_or(false) {
         format!("periodic ({}s)", req.period_seconds.unwrap_or(0))
@@ -800,9 +899,15 @@ async fn handle_add_process(
         "regular".to_string()
     };
     
+    let auto_restart_info = if config.auto_restart {
+        " with auto-restart enabled"
+    } else {
+        ""
+    };
+    
     let response = ApiResponse {
         success: true,
-        message: format!("Process {} added successfully as {}", req.id, process_type),
+        message: format!("Process {} added successfully as {}{}", req.id, process_type, auto_restart_info),
     };
     
     Ok(warp::reply::json(&response))
@@ -817,6 +922,11 @@ async fn handle_restart_process(
     let config = {
         let mut processes_lock = processes.lock().unwrap();
         if let Some(managed_process) = processes_lock.get_mut(&id) {
+            // Stop auto-restart monitor first
+            if let Some(handle) = managed_process.auto_restart_handle.take() {
+                handle.abort();
+            }
+            
             // Stop the current process
             if let Some(ref mut child) = managed_process.child {
                 let _ = child.kill();
@@ -838,6 +948,14 @@ async fn handle_restart_process(
     };
     
     if let Some(config) = config {
+        // Increment run count for manual restart
+        {
+            let mut processes_lock = processes.lock().unwrap();
+            if let Some(managed_process) = processes_lock.get_mut(&id) {
+                managed_process.run_count += 1;
+            }
+        }
+        
         start_process(processes, config, host, port).await;
         let response = ApiResponse {
             success: true,
@@ -861,6 +979,11 @@ async fn handle_stop_process(
 ) -> Result<impl warp::Reply, warp::Rejection> {
     let mut processes_lock = processes.lock().unwrap();
     if let Some(managed_process) = processes_lock.get_mut(&id) {
+        // Stop auto-restart monitor first
+        if let Some(handle) = managed_process.auto_restart_handle.take() {
+            handle.abort();
+        }
+        
         if let Some(ref mut child) = managed_process.child {
             let _ = child.kill();
             let _ = child.wait();
@@ -873,10 +996,10 @@ async fn handle_stop_process(
         
         managed_process.child = None;
         managed_process.periodic_handle = None;
-        managed_process.status = ProcessStatus::Stopped;
+        managed_process.status = ProcessStatus::ManuallyStopped; // Mark as manually stopped
         
         // Log the stop
-        let stop_log = format!("[{}] SYSTEM {}:{}: Process stopped manually\n", 
+        let stop_log = format!("[{}] SYSTEM {}:{}: Process stopped manually via API\n", 
             chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), host, port);
         let _ = SAFE_LOGGER.safe_append_log(&managed_process.config.log_file, &stop_log);
         
@@ -902,6 +1025,11 @@ async fn handle_remove_process(
 ) -> Result<impl warp::Reply, warp::Rejection> {
     let mut processes_lock = processes.lock().unwrap();
     if let Some(mut managed_process) = processes_lock.remove(&id) {
+        // Stop auto-restart monitor first
+        if let Some(handle) = managed_process.auto_restart_handle.take() {
+            handle.abort();
+        }
+        
         if let Some(ref mut child) = managed_process.child {
             let _ = child.kill();
             let _ = child.wait();
@@ -942,6 +1070,11 @@ async fn handle_restart_all(processes: ProcessMap, host: Arc<String>, port: u16)
         let mut configs = Vec::new();
         
         for (_, managed_process) in processes_lock.iter_mut() {
+            // Stop auto-restart monitor first
+            if let Some(handle) = managed_process.auto_restart_handle.take() {
+                handle.abort();
+            }
+            
             // Stop regular processes
             if let Some(ref mut child) = managed_process.child {
                 let _ = child.kill();
@@ -976,6 +1109,11 @@ async fn handle_restart_all(processes: ProcessMap, host: Arc<String>, port: u16)
 async fn handle_stop_all(processes: ProcessMap) -> Result<impl warp::Reply, warp::Rejection> {
     let mut processes_lock = processes.lock().unwrap();
     for (_, managed_process) in processes_lock.iter_mut() {
+        // Stop auto-restart monitor first
+        if let Some(handle) = managed_process.auto_restart_handle.take() {
+            handle.abort();
+        }
+        
         // Stop regular processes
         if let Some(ref mut child) = managed_process.child {
             let _ = child.kill();
@@ -989,7 +1127,7 @@ async fn handle_stop_all(processes: ProcessMap) -> Result<impl warp::Reply, warp
         
         managed_process.child = None;
         managed_process.periodic_handle = None;
-        managed_process.status = ProcessStatus::Stopped;
+        managed_process.status = ProcessStatus::ManuallyStopped; // Mark as manually stopped
     }
     
     let response = ApiResponse {
@@ -1081,6 +1219,7 @@ async fn handle_list_processes(processes: ProcessMap) -> Result<impl warp::Reply
             ProcessStatus::Stopped => "stopped",
             ProcessStatus::WaitingForPeriod => "waiting",
             ProcessStatus::Failed => "failed",
+            ProcessStatus::ManuallyStopped => "manually_stopped",
         };
         
         process_list.push(serde_json::json!({
@@ -1179,6 +1318,12 @@ async fn handle_shutdown(
     {
         let mut processes_lock = processes.lock().unwrap();
         for (id, managed_process) in processes_lock.iter_mut() {
+            // Stop auto-restart monitor first
+            if let Some(handle) = managed_process.auto_restart_handle.take() {
+                println!("Stopping auto-restart monitor for: {}", id);
+                handle.abort();
+            }
+            
             // Stop regular processes
             if let Some(ref mut child) = managed_process.child {
                 println!("Stopping process: {}", id);
@@ -1353,8 +1498,7 @@ fn get_lock_file_path() -> PathBuf {
 }
 
 fn is_process_running(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
+ 
         use std::process::Command;
         
         // Use kill -0 to check if process exists without actually killing it
@@ -1362,11 +1506,18 @@ fn is_process_running(pid: u32) -> bool {
             .args(["-0", &pid.to_string()])
             .output()
         {
-            Ok(output) => output.status.success(),
-            Err(_) => false,
+            Ok(output) => {
+                let result = output.status.success();
+                eprintln!("DEBUG: kill -0 {} -> exit_code: {:?}, success: {}", 
+                         pid, output.status.code(), result);
+                result
+            },
+            Err(e) => {
+                eprintln!("DEBUG: kill -0 {} -> error: {}", pid, e);
+                false
+            },
         }
-    }
-    
+
 }
 
 fn setup_cleanup_handler(lock_path: PathBuf) {
@@ -1536,3 +1687,196 @@ fn read_logs_chunked(
     lines.reverse();
     Ok((lines, total_lines))
 }
+
+fn start_auto_restart_monitor(
+    processes: ProcessMap, 
+    config: ProcessConfig, 
+    host: Arc<String>, 
+    port: u16, 
+    child_pid: u32
+) -> tokio::task::JoinHandle<()> {
+    let processes_clone = processes.clone();
+    let config_clone = config.clone();
+    let host_clone = host.clone();
+    
+    tokio::spawn(async move {
+        // Log that monitoring started
+        let monitor_log = format!("[{}] SYSTEM {}:{}: Auto-restart monitor started for process '{}' (PID: {})\n", 
+            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), host_clone, port, config_clone.id, child_pid);
+        let _ = SAFE_LOGGER.safe_append_log(&config_clone.log_file, &monitor_log);
+        
+        // Get the child process handle and wait for it asynchronously
+        let child_option = {
+            let mut processes_lock = processes_clone.lock().unwrap();
+            if let Some(managed_process) = processes_lock.get_mut(&config_clone.id) {
+                managed_process.child.take()
+            } else {
+                None
+            }
+        };
+        
+        if let Some(mut child) = child_option {
+            // Wait for the child process to exit efficiently using tokio's async wait
+            let wait_result = tokio::task::spawn_blocking(move || {
+                child.wait()
+            }).await;
+            
+            match wait_result {
+                Ok(Ok(exit_status)) => {
+                    let now = chrono::Utc::now();
+                    
+                    // Log process exit detection
+                    let exit_log = format!("[{}] SYSTEM {}:{}: Auto-restart monitor detected process '{}' (PID: {}) has exited with status: {}\n", 
+                        now.format("%Y-%m-%d %H:%M:%S"), host_clone, port, config_clone.id, child_pid, exit_status);
+                    let _ = SAFE_LOGGER.safe_append_log(&config_clone.log_file, &exit_log);
+                    
+                    // Check if we should restart the process
+                    let (should_restart, restart_delay, was_manual_stop) = {
+                        let mut processes_lock = processes_clone.lock().unwrap();
+                        if let Some(managed_process) = processes_lock.get_mut(&config_clone.id) {
+                            managed_process.last_exit_time = Some(now);
+                            
+                            // Check the current status to determine if this was a manual stop
+                            let was_manual = matches!(managed_process.status, ProcessStatus::ManuallyStopped);
+                            
+                            // Only restart if the process is still marked as Running (not manually stopped)
+                            let should_restart = matches!(managed_process.status, ProcessStatus::Running) && 
+                                                 config_clone.auto_restart;
+                            
+                            if should_restart {
+                                // Update status to Failed for restart
+                                managed_process.status = ProcessStatus::Failed;
+                                managed_process.child = None;
+                                managed_process.stdin_sender = None;
+                                
+                                // Calculate restart delay with exponential backoff to prevent restart loops
+                                let delay = calculate_restart_delay(managed_process.run_count, managed_process.last_exit_time);
+                                
+                                // Increment run count for restart
+                                managed_process.run_count += 1;
+                                
+                                (true, delay, was_manual)
+                            } else {
+                                // Process was manually stopped or auto-restart is disabled
+                                managed_process.child = None;
+                                managed_process.stdin_sender = None;
+                                if !was_manual {
+                                    managed_process.status = ProcessStatus::Stopped;
+                                }
+                                (false, 0, was_manual)
+                            }
+                        } else {
+                            (false, 0, false)
+                        }
+                    };
+                    
+                    // Log restart decision
+                    let decision_log = format!("[{}] SYSTEM {}:{}: Auto-restart decision for '{}': should_restart={}, was_manual_stop={}, delay={}s\n", 
+                        now.format("%Y-%m-%d %H:%M:%S"), host_clone, port, config_clone.id, should_restart, was_manual_stop, restart_delay);
+                    let _ = SAFE_LOGGER.safe_append_log(&config_clone.log_file, &decision_log);
+                    
+                    if should_restart {
+                        // Log restart initiation
+                        let restart_init_log = format!("[{}] SYSTEM {}:{}: Initiating auto-restart for process '{}' (PID: {}) in {}s\n", 
+                            now.format("%Y-%m-%d %H:%M:%S"), host_clone, port, config_clone.id, child_pid, restart_delay);
+                        let _ = SAFE_LOGGER.safe_append_log(&config_clone.log_file, &restart_init_log);
+                        
+                        // Send restart request with delay
+                        if let Some(sender) = RESTART_SENDER.lock().unwrap().as_ref() {
+                            let exit_code = exit_status.code().unwrap_or(-1);
+                            let reason = if exit_code == 0 {
+                                format!("Auto-restarting process '{}' after normal exit (PID: {})", config_clone.id, child_pid)
+                            } else if exit_code == 9 || exit_code == 15 {
+                                format!("Auto-restarting process '{}' after external kill signal {} (PID: {})", config_clone.id, exit_code, child_pid)
+                            } else {
+                                format!("Auto-restarting process '{}' after crash with exit code {} (PID: {})", config_clone.id, exit_code, child_pid)
+                            };
+                            
+                            let request = RestartRequest {
+                                process_id: config_clone.id.clone(),
+                                delay_seconds: restart_delay,
+                                reason,
+                            };
+                            
+                            match sender.send(request) {
+                                Ok(_) => {
+                                    let send_log = format!("[{}] SYSTEM {}:{}: Auto-restart request sent for process '{}'\n", 
+                                        now.format("%Y-%m-%d %H:%M:%S"), host_clone, port, config_clone.id);
+                                    let _ = SAFE_LOGGER.safe_append_log(&config_clone.log_file, &send_log);
+                                }
+                                Err(e) => {
+                                    let error_log = format!("[{}] SYSTEM {}:{}: Failed to send auto-restart request for process '{}': {}\n", 
+                                        now.format("%Y-%m-%d %H:%M:%S"), host_clone, port, config_clone.id, e);
+                                    let _ = SAFE_LOGGER.safe_append_log(&config_clone.log_file, &error_log);
+                                }
+                            }
+                        }
+                    } else if was_manual_stop {
+                        let manual_log = format!("[{}] SYSTEM {}:{}: Process '{}' (PID: {}) exited after manual stop - no restart\n", 
+                            now.format("%Y-%m-%d %H:%M:%S"), host_clone, port, config_clone.id, child_pid);
+                        let _ = SAFE_LOGGER.safe_append_log(&config_clone.log_file, &manual_log);
+                    }
+                }
+                Ok(Err(e)) => {
+                    let error_log = format!("[{}] SYSTEM {}:{}: Error waiting for process '{}' (PID: {}): {}\n", 
+                        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), host_clone, port, config_clone.id, child_pid, e);
+                    let _ = SAFE_LOGGER.safe_append_log(&config_clone.log_file, &error_log);
+                }
+                Err(e) => {
+                    let error_log = format!("[{}] SYSTEM {}:{}: Tokio task error for process '{}' (PID: {}): {}\n", 
+                        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), host_clone, port, config_clone.id, child_pid, e);
+                    let _ = SAFE_LOGGER.safe_append_log(&config_clone.log_file, &error_log);
+                }
+            }
+        } else {
+            let no_child_log = format!("[{}] SYSTEM {}:{}: No child process found for auto-restart monitoring of '{}' (PID: {})\n", 
+                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), host_clone, port, config_clone.id, child_pid);
+            let _ = SAFE_LOGGER.safe_append_log(&config_clone.log_file, &no_child_log);
+        }
+        
+        // Clean up auto-restart handle when monitor ends
+        {
+            let mut processes_lock = processes_clone.lock().unwrap();
+            if let Some(managed_process) = processes_lock.get_mut(&config_clone.id) {
+                managed_process.auto_restart_handle = None;
+            }
+        }
+        
+        // Log that monitoring ended
+        let end_log = format!("[{}] SYSTEM {}:{}: Auto-restart monitor ended for process '{}' (PID: {})\n", 
+            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"), host_clone, port, config_clone.id, child_pid);
+        let _ = SAFE_LOGGER.safe_append_log(&config_clone.log_file, &end_log);
+    })
+}
+
+// Calculate restart delay with exponential backoff and recent exit detection
+fn calculate_restart_delay(run_count: u64, last_exit_time: Option<chrono::DateTime<chrono::Utc>>) -> u64 {
+    // If the process exited very recently (within 10 seconds), increase delay significantly
+    let rapid_restart_penalty = if let Some(last_exit) = last_exit_time {
+        let time_since_last_exit = chrono::Utc::now().signed_duration_since(last_exit);
+        if time_since_last_exit.num_seconds() < 10 {
+            20 // Add 20 seconds penalty for rapid restarts
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    
+    // Base delay calculation with exponential backoff
+    let base_delay = if run_count <= 3 {
+        2 // 2 seconds for first 3 restarts
+    } else if run_count <= 6 {
+        5 // 5 seconds for next 3 restarts
+    } else if run_count <= 10 {
+        15 // 15 seconds for next 4 restarts
+    } else if run_count <= 15 {
+        30 // 30 seconds for next 5 restarts
+    } else {
+        60 // 1 minute for subsequent restarts
+    };
+    
+    base_delay + rapid_restart_penalty
+}
+
+
