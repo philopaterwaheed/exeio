@@ -1,6 +1,11 @@
 # exeio
 
+
+<img width="1024" height="1024" alt="exeio_logo" src="https://github.com/user-attachments/assets/36c337a0-fe6b-4504-83f6-8a21e065aa6f" />
+
 A powerful process supervisor written in Rust that helps developers, system administrators, and DevOps engineers run, monitor, and manage processes remotely through a secure REST API interface.
+
+> **Origin Story**: I developed exeio while managing my project [Planitly](https://github.com/philopaterwaheed/planitly_backend), where I needed to run and monitor multiple processes on server startup without SSH access. The ability to view logs, provide input when needed, and control processes through a simple API interface became essential for efficient server management.
 
 ## Table of Contents
 
