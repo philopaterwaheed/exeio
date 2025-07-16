@@ -9,6 +9,7 @@ A powerful process supervisor written in Rust that helps developers, system admi
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
+- [Auto-Restart Feature](#auto-restart-feature)
 - [API Reference](#api-reference)
 - [Examples](#examples)
 - [Architecture](#architecture)
@@ -20,7 +21,9 @@ A powerful process supervisor written in Rust that helps developers, system admi
 ## Features
 
 ### Core Capabilities
-- **process Supervision:** Start, stop, restart, and monitor multiple processes 
+
+- **Process Supervision:** Start, stop, restart, and monitor multiple processes
+- **Auto-Restart:** Intelligent automatic process recovery with exponential backoff
 - **REST API:** Complete HTTP-based control interface with authentication
 - **Periodic Processes:** Schedule recurring tasks with configurable intervals
 - **Real-time Monitoring:** Live process status tracking and logging
@@ -171,6 +174,261 @@ exeio --help
   "period_seconds": 60
 }
 ```
+
+## Auto-Restart Feature
+
+The auto-restart feature is one of exeio's most powerful capabilities, providing automatic process recovery to ensure high availability and reliability of your applications.
+
+### What is Auto-Restart?
+
+Auto-restart monitors running processes and automatically restarts them when they exit unexpectedly. This feature helps maintain service uptime by recovering from:
+
+- **Application crashes** (exit code ≠ 0)
+- **Normal exits** (exit code = 0) that shouldn't terminate the service
+- **Memory leaks** causing process termination
+- **External kills** (signals from other processes)
+- **System resource exhaustion**
+
+### When to Use Auto-Restart
+
+#### Ideal Use Cases
+
+- **Web Servers & APIs:** Keep HTTP services running continuously
+- **Database Processes:** Maintain database availability
+- **Background Workers:** Ensure queue processors stay active
+- **Microservices:** Maintain service mesh components
+- **Development Servers:** Automatically restart dev environments
+- **Data Processing:** Restart failed ETL jobs
+- **Real-time Applications:** Keep streaming/chat services alive
+- **System Daemons:** Maintain critical system processes
+
+#### When NOT to Use Auto-Restart
+
+- **One-time Scripts:** Tasks meant to run once and exit
+- **Batch Jobs:** Scheduled tasks with defined completion
+- **Manual Processes:** Interactive applications requiring user input
+- **Testing Scripts:** Temporary validation or testing processes
+- **Migration Scripts:** Database migrations or one-time setup tasks
+
+### How Auto-Restart Works
+
+1. **Process Monitoring:** exeio starts a dedicated monitor thread for each auto-restart enabled process
+2. **Exit Detection:** The monitor detects when the process terminates (any exit code)
+3. **Restart Decision:** Determines if restart should occur based on process status
+4. **Intelligent Delays:** Implements exponential backoff to prevent rapid restart loops
+5. **Status Tracking:** Updates process status and logs all restart activity
+
+### Restart Delay Algorithm
+
+exeio uses intelligent exponential backoff to prevent restart loops and system overload:
+
+```
+Base Delays:
+• Restarts 1-3:   2 seconds
+• Restarts 4-6:   5 seconds  
+• Restarts 7-10:  15 seconds
+• Restarts 11-15: 30 seconds
+• Restarts 16+:   60 seconds
+
+Rapid Restart Penalty:
+• If process exits within 10 seconds: +20 seconds delay
+```
+
+**Example Timeline:**
+```
+Restart #1: 2s delay
+Restart #2: 2s delay  
+Restart #3: 2s delay (if exits quickly: 22s delay)
+Restart #4: 5s delay
+Restart #7: 15s delay
+Restart #16: 60s delay
+```
+
+### Configuration
+
+Enable auto-restart when adding a process:
+
+```json
+{
+  "id": "web-server",
+  "command": "node",
+  "args": ["server.js"],
+  "auto_restart": true,      // Enable auto-restart
+  "save_for_next_run": true  // Optional: persist for next exeio startup
+}
+```
+
+### Manual Stop vs Auto-Restart
+
+Auto-restart intelligently distinguishes between manual stops and unexpected exits:
+
+- **Manual Stop:** `POST /stop/{process_id}` - Process will NOT auto-restart
+- **Unexpected Exit:** Process crashes or exits - Process WILL auto-restart
+- **Manual Restart:** `POST /restart/{process_id}` - Restarts immediately
+
+### Testing Auto-Restart
+
+Here's how to test the auto-restart functionality:
+
+#### Test 1: Normal Process Exit
+```bash
+# Create a test script that exits normally
+echo '#!/bin/bash
+echo "Process started"
+sleep 5
+echo "Process exiting normally"
+exit 0' > test_normal_exit.sh
+
+chmod +x test_normal_exit.sh
+
+# Add with auto-restart
+curl -X POST http://localhost:8080/add \
+  -H "exeio-api-key: your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "test-normal",
+    "command": "./test_normal_exit.sh",
+    "auto_restart": true
+  }'
+
+# Watch it restart automatically every ~7 seconds
+curl -H "exeio-api-key: your-api-key" \
+  "http://localhost:8080/logs/test-normal"
+```
+
+#### Test 2: Process Crash
+```bash
+# Create a script that crashes
+echo '#!/bin/bash
+echo "Process started"
+sleep 3
+echo "Simulating crash!"
+exit 1' > test_crash.sh
+
+chmod +x test_crash.sh
+
+# Add with auto-restart
+curl -X POST http://localhost:8080/add \
+  -H "exeio-api-key: your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "test-crash",
+    "command": "./test_crash.sh", 
+    "auto_restart": true
+  }'
+
+# Watch auto-restart after crash
+curl -H "exeio-api-key: your-api-key" \
+  "http://localhost:8080/logs/test-crash"
+```
+
+#### Test 3: Manual Stop (No Restart)
+```bash
+# Stop the process manually
+curl -X POST http://localhost:8080/stop/test-crash \
+  -H "exeio-api-key: your-api-key"
+
+# Verify it stays stopped
+curl -H "exeio-api-key: your-api-key" \
+  http://localhost:8080/list | jq '.[] | select(.id == "test-crash")'
+```
+
+### Monitoring Auto-Restart Activity
+
+#### Log Messages to Watch For
+
+```bash
+# Auto-restart monitoring started
+[2025-07-16 04:10:02] SYSTEM: Auto-restart monitor started for process 'web-server' (PID: 12345)
+
+# Process exit detected  
+[2025-07-16 04:10:07] SYSTEM: Auto-restart monitor detected process 'web-server' (PID: 12345) has exited with status: exit status: 1
+
+# Restart decision
+[2025-07-16 04:10:07] SYSTEM: Auto-restart decision for 'web-server': should_restart=true, was_manual_stop=false, delay=2s
+
+# Restart initiated
+[2025-07-16 04:10:07] SYSTEM: Initiating auto-restart for process 'web-server' (PID: 12345) in 2s
+
+# Different restart reasons
+[2025-07-16 04:10:09] SYSTEM: Auto-restarting process 'web-server' after crash with exit code 1 (PID: 12345)
+[2025-07-16 04:10:09] SYSTEM: Auto-restarting process 'web-server' after normal exit (PID: 12345) 
+[2025-07-16 04:10:09] SYSTEM: Auto-restarting process 'web-server' after external kill signal 9 (PID: 12345)
+```
+
+#### Status Monitoring
+```bash
+# Check process status
+curl -H "exeio-api-key: your-api-key" http://localhost:8080/list
+
+# Key fields for auto-restart monitoring:
+{
+  "id": "web-server",
+  "status": "running",          // Current status
+  "auto_restart": true,         // Auto-restart enabled
+  "run_count": 5,              // Number of times restarted  
+  "last_run": "2025-07-16T04:10:09Z"  // Last restart time
+}
+```
+
+### Best Practices
+
+#### 1. Resource Management
+```bash
+# Ensure your processes handle signals gracefully
+trap 'echo "Received SIGTERM, cleaning up..."; exit 0' SIGTERM
+```
+
+#### 2. Health Check Integration
+```bash
+# Include health checks in your applications
+while true; do
+  if ! health_check; then
+    echo "Health check failed, exiting for restart"
+    exit 1
+  fi
+  sleep 30
+done
+```
+
+#### 3. Log Rotation
+```bash
+# Monitor log file sizes for auto-restart processes
+ls -lh ~/.local/share/exeio/logs/
+```
+
+#### 4. Production Deployment
+```json
+{
+  "id": "production-api",
+  "command": "node",
+  "args": ["server.js"],
+  "working_dir": "/app",
+  "auto_restart": true,
+  "save_for_next_run": true  // Persist across exeio restarts
+}
+```
+
+### Common Issues & Solutions
+
+#### Issue: Restart Loop
+**Symptoms:** Process keeps restarting rapidly
+**Solution:** Check logs for startup errors, fix application issues
+
+#### Issue: Process Won't Start
+**Symptoms:** Auto-restart enabled but process shows "failed" status
+**Solution:** Verify command path, permissions, and working directory
+
+#### Issue: Too Many Restarts
+**Symptoms:** High restart counts
+**Solution:** Investigate application stability, add health checks
+
+### Performance Impact
+
+Auto-restart monitoring has minimal overhead:
+- **Memory:** ~1-2MB per monitored process
+- **CPU:** Negligible (event-driven monitoring)
+- **Disk:** Only log file writes
 
 ## API Reference
 
@@ -385,11 +643,89 @@ curl -X POST http://localhost:8080/add \
   }'
 ```
 
+### Example 4: Production Auto-Restart Setup
+```bash
+# Critical web service with auto-restart
+curl -X POST http://localhost:8080/add \
+  -H "exeio-api-key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "production-api",
+    "command": "node",
+    "args": ["dist/server.js"],
+    "working_dir": "/app",
+    "auto_restart": true,
+    "save_for_next_run": true
+  }'
+
+# Background job processor that should always run
+curl -X POST http://localhost:8080/add \
+  -H "exeio-api-key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "job-processor",
+    "command": "python3",
+    "args": ["worker.py"],
+    "working_dir": "/app/workers",
+    "auto_restart": true,
+    "save_for_next_run": true
+  }'
+
+# Monitor the auto-restart activity
+curl -H "exeio-api-key: $API_KEY" \
+  "http://localhost:8080/logs/production-api?page=1&page_size=20"
+
+# Check restart counts and status
+curl -H "exeio-api-key: $API_KEY" \
+  http://localhost:8080/list | jq '.[] | {id, status, run_count, auto_restart}'
+```
+
+### Example 5: Mixed Auto-Restart and Manual Processes  
+```bash
+# Long-running service that should auto-restart
+curl -X POST http://localhost:8080/add \
+  -H "exeio-api-key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "redis-server",
+    "command": "redis-server",
+    "args": ["--port", "6379"],
+    "auto_restart": true,
+    "save_for_next_run": true
+  }'
+
+# One-time migration script (no auto-restart)
+curl -X POST http://localhost:8080/add \
+  -H "exeio-api-key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "database-migration",
+    "command": "npm",
+    "args": ["run", "migrate"],
+    "working_dir": "/app",
+    "auto_restart": false,
+    "save_for_next_run": false
+  }'
+
+# Development server (auto-restart for crashes only)
+curl -X POST http://localhost:8080/add \
+  -H "exeio-api-key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "dev-server",
+    "command": "npm",
+    "args": ["run", "dev"],
+    "working_dir": "/app",
+    "auto_restart": true,
+    "save_for_next_run": false
+  }'
+```
+
 ## Architecture
 
 ### System Design
-```
-┌─────────────────┐    HTTP/REST    ┌─────────────────┐
+```text
+┌─────────────────┐    HTTP/REST     ┌─────────────────┐
 │   Client Apps   │ ◄──────────────► │   exeio API     │
 │                 │                  │   (Auth Layer)  │
 └─────────────────┘                  └─────────────────┘
@@ -404,7 +740,7 @@ curl -X POST http://localhost:8080/add \
                         ▼                     ▼                     ▼
                 ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
                 │  Process A   │    │  Process B   │    │  Process C   │
-                │  (Regular)   │    │ (Periodic)   │    │  (Auto-restart) │
+                │  (Regular)   │    │ (Periodic)   │    │(Auto-restart)│
                 └──────────────┘    └──────────────┘    └──────────────┘
                         │                     │                     │
                         ▼                     ▼                     ▼
